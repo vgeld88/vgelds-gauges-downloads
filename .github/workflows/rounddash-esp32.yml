@@ -45,6 +45,32 @@ jobs:
           assert image[0x10000] == 0xe9
           print('Merged image verified, bytes:',len(image))
           PY
+      - name: Compile complete RoundDash V6 app-compatible firmware
+        shell: bash
+        run: |
+          arduino-cli compile -b esp32:esp32:esp32 --output-dir build_full \
+            --build-property "compiler.cpp.extra_flags=-DUSER_SETUP_LOADED -DGC9A01_DRIVER -DTFT_WIDTH=240 -DTFT_HEIGHT=240 -DTFT_MOSI=23 -DTFT_SCLK=18 -DTFT_CS=15 -DTFT_DC=2 -DTFT_RST=4 -DLOAD_GLCD -DLOAD_FONT2 -DLOAD_FONT4 -DSPI_FREQUENCY=40000000" \
+            ESP32_RoundDash_Companion
+      - name: Merge complete RoundDash V6 image
+        shell: bash
+        run: |
+          python3 -m esptool --chip esp32 merge_bin -o RoundDash_V6_FULL_MERGED.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000 build_full/ESP32_RoundDash_Companion.ino.bootloader.bin \
+            0x8000 build_full/ESP32_RoundDash_Companion.ino.partitions.bin \
+            0xe000 ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/boot_app0.bin \
+            0x10000 build_full/ESP32_RoundDash_Companion.ino.bin
+          python3 - <<'PY'
+          from pathlib import Path
+          image=Path('RoundDash_V6_FULL_MERGED.bin').read_bytes()
+          assert len(image) > 0x11000 and image[0x1000] == 0xe9 and image[0x10000] == 0xe9
+          print('Full image validated:',len(image),'bytes')
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RoundDash_V6_FULL_MERGED
+          path: RoundDash_V6_FULL_MERGED.bin
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: RoundDash_GC9A01_DEMO_MERGED
