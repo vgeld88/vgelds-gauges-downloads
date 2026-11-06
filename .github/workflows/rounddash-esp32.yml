@@ -48,7 +48,7 @@ jobs:
       - name: Compile complete RoundDash V6 app-compatible firmware
         shell: bash
         run: |
-          arduino-cli compile -b esp32:esp32:esp32 --output-dir build_full \
+          arduino-cli compile -b esp32:esp32:esp32:PartitionScheme=huge_app --output-dir build_full \
             --build-property "compiler.cpp.extra_flags=-DUSER_SETUP_LOADED -DGC9A01_DRIVER -DTFT_WIDTH=240 -DTFT_HEIGHT=240 -DTFT_MOSI=23 -DTFT_SCLK=18 -DTFT_CS=15 -DTFT_DC=2 -DTFT_RST=4 -DLOAD_GLCD -DLOAD_FONT2 -DLOAD_FONT4 -DSPI_FREQUENCY=40000000" \
             ESP32_RoundDash_Companion
       - name: Merge complete RoundDash V6 image
