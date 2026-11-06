@@ -1172,7 +1172,7 @@ void setup() {
   bluetoothReady = bt.begin("ESP32-OBD-DASH", true);
   if (bluetoothReady) {
     // Only needed for adapters that use a classic legacy PIN.
-    bt.setPin(cfg.obdPin.c_str(), cfg.obdPin.length());
+    bt.setPin(cfg.obdPin.c_str());
     linkState = LinkState::RETRY_WAIT;
     retryAt = millis() - RECONNECT_MS; // try right away
   } else {
