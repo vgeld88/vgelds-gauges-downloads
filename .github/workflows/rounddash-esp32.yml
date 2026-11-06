@@ -1,0 +1,12 @@
+name: RoundDash ESP32 firmware build
+on:
+  push:
+    branches: [rounddash-build-esp32]
+  workflow_dispatch:
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify build runner
+        run: echo "RoundDash ESP32 build environment ready"
