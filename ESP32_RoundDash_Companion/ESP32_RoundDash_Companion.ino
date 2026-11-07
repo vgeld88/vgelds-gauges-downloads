@@ -94,6 +94,13 @@ struct GaugeConfig {
   int valueY = 166;
   int unitY = 188;
   bool autoCycle = true;
+  // Triple dashboard, 3 independent gauges for each user-selected page.
+  bool tripleMode = true;
+  uint8_t tripleCount = 4;
+  uint8_t tripleSlots[8][3] = {
+    {0,1,2},{0,3,4},{5,6,0},{3,7,8},
+    {0,3,5},{1,4,2},{0,6,7},{3,9,10}
+  };
   uint32_t cycleMs = 7000;
   String rpmTitle = "ENGINE SPEED";
   String coolantTitle = "COOLANT";
@@ -151,6 +158,45 @@ float peakBoost = -1000.0f;
 
 // ------------------------- UI INPUT ------------------------------
 uint8_t currentPage = 0;
+static const uint8_t TRIPLE_SENSOR_COUNT = 16;
+static uint8_t pageTotal(){return cfg.tripleMode?constrain((int)cfg.tripleCount,1,8):4;}
+static const char* tripleLabel(uint8_t i){
+  const char* const a[]={"BOOST","COOLANT","VOLTS","RPM","DAM","AFR","WGDC",
+    "FLKC","TIMING","THROTTLE","IAT","AF LEARN","AF CORR","MAP","BARO","MAF V"};
+  return i<TRIPLE_SENSOR_COUNT?a[i]:"--";
+}
+static const char* tripleUnit(uint8_t i){
+  const char* const a[]={"PSI","C","V","RPM","IAM","AFR","%","DEG",
+    "DEG","%","C","%","%","KPA","KPA","V"};
+  return i<TRIPLE_SENSOR_COUNT?a[i]:"";
+}
+static Reading* tripleReading(uint8_t i){
+  Reading* a[]={&boostPsi,&coolantC,&moduleV,&engineRpm,&ssmIam,&ssmAfr,
+    &ssmWgdc,&ssmFlkc,&ssmTiming,&ssmThrottle,&ssmIat,&ssmAfLearning,
+    &ssmAfCorrection,&mapKpa,&baroKpa,&ssmMafVolt};
+  return i<TRIPLE_SENSOR_COUNT?a[i]:nullptr;
+}
+static void tripleRange(uint8_t i,float &lo,float &hi){
+  const float a[]={-15,40,10,0,0,7,0,-8,-20,0,-30,-30,-30,0,70,0};
+  const float b[]={30,120,16,8000,1,20,100,2,60,100,120,30,30,300,120,5};
+  if(i>=TRIPLE_SENSOR_COUNT)i=0;
+  lo=a[i];hi=b[i];
+  if(i==0){lo=cfg.boostMin;hi=cfg.boostMax;}
+  if(i==1){lo=cfg.coolantMin;hi=cfg.coolantMax;}
+  if(i==2){lo=cfg.voltageMin;hi=cfg.voltageMax;}
+  if(i==3)hi=cfg.rpmMax;
+}
+static bool tripleTuple(String src,uint8_t *out){
+  src.trim();
+  int a=-1,b=-1,c=-1;
+  char junk=0;
+  if(sscanf(src.c_str(),"%d,%d,%d%c",&a,&b,&c,&junk)!=3)return false;
+  if(a<0||b<0||c<0||a>=TRIPLE_SENSOR_COUNT||
+     b>=TRIPLE_SENSOR_COUNT||c>=TRIPLE_SENSOR_COUNT)return false;
+  out[0]=(uint8_t)a;out[1]=(uint8_t)b;out[2]=(uint8_t)c;
+  return true;
+}
+
 uint32_t pageChangedAt = 0;
 uint32_t phonePageHoldUntil = 0;
 bool lastRawPressed = false;
@@ -178,7 +224,8 @@ static bool fresh(const Reading &r, uint32_t now) {
 }
 
 void changePage(int direction, uint32_t now) {
-  currentPage = (uint8_t)((currentPage + (direction > 0 ? 1 : 3)) % 4);
+  const uint8_t total=pageTotal();
+  currentPage=(uint8_t)((currentPage + (direction>0?1:total-1))%total);
   pageChangedAt = now;
   lastFrameAt = 0;  // Force an immediate redraw
 }
@@ -219,7 +266,7 @@ void updateButton(uint32_t now) {
       }
     }
   }
-  if (cfg.autoCycle && !stablePressed && (int32_t)(now - phonePageHoldUntil) >= 0 && elapsed(now, pageChangedAt, cfg.cycleMs)) {
+  if (cfg.autoCycle && !cfg.tripleMode && !stablePressed && (int32_t)(now - phonePageHoldUntil) >= 0 && elapsed(now, pageChangedAt, cfg.cycleMs)) {
     changePage(1, now);
   }
 }
