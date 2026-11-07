@@ -47,16 +47,6 @@ enum RadioMode : uint8_t { MODE_WIFI_EDITOR = 0, MODE_BLUETOOTH_OBD = 1 };
 static uint8_t radioMode = MODE_WIFI_EDITOR;
 static bool bluetoothStarted = false;
 static bool wifiApReady = false;
-// V13 hotspot/client mode. Credentials are provisioned locally by the user,
-// saved in NVS, and NEVER published in status responses or serial logs.
-static String hotspotName;
-static String hotspotPassword;
-static bool hotspotConfigured = false;
-static bool hotspotProvisionPending = false;
-static bool hotspotClearPending = false;
-static bool hotspotWasConnected = false;
-static uint32_t nextHotspotAttemptAt = 0;
-static uint32_t hotspotPendingAt = 0;
 static volatile uint32_t apJoins = 0, apLeaves = 0;
 RTC_NOINIT_ATTR uint32_t rebootMagic;
 RTC_NOINIT_ATTR uint32_t rebootCount;
@@ -845,8 +835,6 @@ static void drawFooter() {
   if (radioMode == MODE_BLUETOOTH_OBD) {
     centerFit(String("DRIVE: ") + message, 211, 1,
               linkState==LinkState::POLLING ? C_GREEN : C_ORANGE, 200);
-  } else if (hotspotConfigured && WiFi.status() == WL_CONNECTED) {
-    centerFit(String("HOTSPOT ") + WiFi.localIP().toString(), 211, 1, C_GREEN, 228);
   } else if (!wifiApReady) {
     centerFit("WIFI AP FAILED", 211, 1, C_RED, 160);
   } else if (WiFi.softAPgetStationNum() > 0) {
@@ -1016,19 +1004,15 @@ void sendJson(int status, const String &body) {
   server.send(status, "application/json", body);
 }
 
-void handleStatus() {
+String statusJson() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"14.0-usb-hotspot\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
+  String out = "{\"ok\":true,\"fw\":\"16.0-usb-editor\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
   out += linkState == LinkState::POLLING && bt.connected(0) ? "true" : "false";
   out += ",\"page\":" + String(currentPage);
   out += ",\"wifiApReady\":" + String(wifiApReady ? "true" : "false");
   out += ",\"wifiChannel\":1";
   out += ",\"bluetoothStarted\":" + String(bluetoothStarted ? "true" : "false");
   out += ",\"radioMode\":\"wifi_setup\"";
-  out += ",\"hotspotConfigured\":" + String(hotspotConfigured ? "true" : "false");
-  out += ",\"hotspotConnected\":" + String((hotspotConfigured && WiFi.status()==WL_CONNECTED) ? "true" : "false");
-  out += ",\"hotspotSsid\":" + jsonQuote(hotspotConfigured ? hotspotName : "");
-  out += ",\"deviceIp\":" + jsonQuote((hotspotConfigured && WiFi.status()==WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString());
   out += ",\"bootCount\":" + String(rebootCount);
   out += ",\"resetReason\":" + jsonQuote(resetText());
   out += ",\"uptimeMs\":" + String((uint32_t)(millis() - startedAt));
@@ -1051,10 +1035,11 @@ void handleStatus() {
   out += ",\"baroKpa\":";
   out += fresh(baroKpa, now) ? String(baroKpa.value, 0) : "null";
   out += "}";
-  sendJson(200, out);
+  return out;
 }
+void handleStatus() { sendJson(200, statusJson()); }
 
-void handleGetConfig() {
+String configJson() {
   String out = "{\"ok\":true,";
   out += "\"accent\":" + jsonQuote(colorHex(cfg.accent565));
   out += ",\"background\":" + jsonQuote(colorHex(cfg.background565));
@@ -1103,8 +1088,9 @@ void handleGetConfig() {
   out += ",\"obdName\":" + jsonQuote(cfg.obdName);
   out += ",\"obdPin\":" + jsonQuote(cfg.obdPin);
   out += "}";
-  sendJson(200, out);
+  return out;
 }
+void handleGetConfig() { sendJson(200, configJson()); }
 
 static bool parseNumber(String s, float &value) {
   s.trim();
@@ -1229,76 +1215,6 @@ void handlePage() {
   } else sendJson(400, "{\"ok\":false,\"message\":\"Page must be 0..3\"}");
 }
 
-void loadHotspotConfig() {
-  Preferences hotspotPrefs;
-  if (hotspotPrefs.begin("rdhotspot", true)) {
-    hotspotName = hotspotPrefs.getString("ssid", "");
-    hotspotPassword = hotspotPrefs.getString("pass", "");
-    hotspotPrefs.end();
-  }
-  hotspotConfigured = hotspotName.length() >= 1 && hotspotName.length() <= 32
-       && hotspotPassword.length() >= 8 && hotspotPassword.length() <= 63;
-}
-void handleHotspotStatus() {
-  String resp = "{\"ok\":true,\"configured\":";
-  resp += hotspotConfigured ? "true" : "false";
-  resp += ",\"connected\":";
-  resp += hotspotConfigured && WiFi.status()==WL_CONNECTED ? "true" : "false";
-  resp += ",\"ssid\":" + jsonQuote(hotspotConfigured ? hotspotName : "");
-  resp += ",\"ip\":" + jsonQuote(hotspotConfigured && WiFi.status()==WL_CONNECTED
-                                  ? WiFi.localIP().toString() : "");
-  resp += "}";
-  sendJson(200, resp);
-}
-void handleHotspotSave() {
-  // Text body: SSID + newline + passphrase. Neither appears in logs or responses.
-  String body = server.arg("plain");
-  int divider = body.indexOf('\n');
-  if (divider < 1 || body.indexOf('\n', divider+1) >= 0 || body.length() > 100) {
-    sendJson(400, "{\"ok\":false,\"message\":\"Expected SSID and password on separate lines\"}");
-    return;
-  }
-  String ssid = body.substring(0, divider);
-  String pass = body.substring(divider + 1);
-  if (ssid.length() < 1 || ssid.length() > 32 || pass.length() < 8 || pass.length() > 63 ||
-      ssid.indexOf('\r') >= 0 || pass.indexOf('\r') >= 0) {
-    sendJson(400, "{\"ok\":false,\"message\":\"SSID must be 1-32 bytes, WPA2 password 8-63 bytes\"}");
-    return;
-  }
-  Preferences prefs;
-  if (!prefs.begin("rdhotspot", false)) {
-    sendJson(500, "{\"ok\":false,\"message\":\"Could not save hotspot settings\"}");
-    return;
-  }
-  bool saved = prefs.putString("ssid", ssid) > 0 &&
-               prefs.putString("pass", pass) > 0;
-  prefs.end();
-  if (!saved) {
-    sendJson(500, "{\"ok\":false,\"message\":\"Could not store credentials\"}");
-    return;
-  }
-  hotspotName = ssid;
-  hotspotPassword = pass;
-  hotspotConfigured = true;
-  hotspotPendingAt = millis();
-  hotspotProvisionPending = true;
-  sendJson(200, "{\"ok\":true,\"message\":\"Saved. Enable your Samsung hotspot in 2.4 GHz mode.\"}");
-}
-void handleHotspotClear() {
-  Preferences prefs;
-  if (!prefs.begin("rdhotspot", false)) {
-    sendJson(500, "{\"ok\":false,\"message\":\"Could not clear settings\"}");
-    return;
-  }
-  prefs.clear();
-  prefs.end();
-  hotspotConfigured = false;
-  hotspotName = "";
-  hotspotPassword = "";
-  hotspotPendingAt = millis();
-  hotspotClearPending = true;
-  sendJson(200, "{\"ok\":true,\"message\":\"Hotspot settings cleared. Returning to ESP32 Wi-Fi.\"}");
-}
 void onSoftAPEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
     apJoins++;
@@ -1325,160 +1241,106 @@ void initHttp() {
   server.on("/api/config", HTTP_POST, [](){handleWriteConfig(true);});
   server.on("/api/preview", HTTP_POST, [](){handleWriteConfig(false);});
   server.on("/api/page", HTTP_POST, handlePage);
-  server.on("/api/hotspot", HTTP_GET, handleHotspotStatus);
-  server.on("/api/hotspot", HTTP_POST, handleHotspotSave);
-  server.on("/api/hotspot/clear", HTTP_POST, handleHotspotClear);
   server.onNotFound([](){sendJson(404,"{\"ok\":false,\"message\":\"Not found\"}");});
   server.begin();
   Serial.printf("RoundDash Wi-Fi: %s / IP %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
-static void serviceHotspot(uint32_t now) {
-  if (hotspotClearPending && (uint32_t)(now-hotspotPendingAt)>600) {
-    hotspotClearPending = false;
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    initHttp(); // original, proven WPA2 AP fallback
-    return;
-  }
-  if (hotspotProvisionPending && (uint32_t)(now-hotspotPendingAt)>700) {
-    hotspotProvisionPending = false;
-    WiFi.mode(WIFI_AP_STA);
-    nextHotspotAttemptAt = now;
-    Serial.println("[HOTSPOT] Credentials saved; enabling station mode.");
-  }
-  if (!hotspotConfigured) return;
-  if (WiFi.status() == WL_CONNECTED) {
-    if (!hotspotWasConnected) {
-      hotspotWasConnected = true;
-      Serial.printf("[HOTSPOT] Connected; local address %s\n",
-                    WiFi.localIP().toString().c_str());
-      // Once the ESP32 joins the Samsung hotspot, release its separate AP.
-      WiFi.softAPdisconnect(false);
-      WiFi.mode(WIFI_STA);
-      wifiApReady = false;
-    }
-    return;
-  }
-  if (hotspotWasConnected) {
-    hotspotWasConnected = false;
-    // When the phone hotspot goes away, restore the working RoundDash AP.
-    WiFi.mode(WIFI_AP_STA);
-    wifiApReady = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4);
-    nextHotspotAttemptAt = now + 15000;
-    Serial.println("[HOTSPOT] Lost phone connection. RoundDash AP restored.");
-  }
-  if ((int32_t)(now-nextHotspotAttemptAt)>=0 && WiFi.softAPgetStationNum()==0) {
-    WiFi.mode(WIFI_AP_STA);
-    WiFi.begin(hotspotName.c_str(), hotspotPassword.c_str());
-    nextHotspotAttemptAt = now + 15000;
-    Serial.println("[HOTSPOT] Trying stored Samsung hotspot (credentials not logged).");
-  }
-}
-// ---------------- USB HOTSPOT PROVISIONING (NO PHONE WI-FI REQUIRED) ---------------
-// Normal firmware USB UART, not ESP32 ROM bootloader. Credentials are hex-encoded
-// on the wire to safely contain punctuation, and are never echoed or logged.
-// Protocol: RDH14SET:<hex-SSID>:<hex-PASSWORD>\n  -> RDH14:OK:SAVED
-//           RDH14PING\n                       -> RDH14:OK:READY
-//           RDH14STATUS\n                     -> RDH14:STATUS:...
-// Configure only on the bench via the user's authorized USB connection.
-static char usbSetupLine[232];
-static size_t usbSetupUsed = 0;
-static uint32_t usbSetupLastByteAt = 0;
 
-static int usbHexDigit(char c) {
-  if (c >= '0' && c <= '9') return c - '0';
-  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+// ------------------ USB SERIAL GAUGE STUDIO V16 -----------------
+// Separate from ROM flashing. No Wi-Fi is necessary for these commands.
+// RD16:PING / RD16:STATUS / RD16:CONFIG / RD16:PAGE:N
+// RD16:SAVE:<HEX key=value\n...> / RD16:PREVIEW:<HEX key=value\n...>
+// Output is one line RD16:OK:, RD16:ERROR:, RD16:STATUS:{}, RD16:CONFIG:{}.
+static String usbEditorLine;
+static uint32_t usbEditorLastByteAt=0;
+static int usbHex(char c) {
+  if(c>='0'&&c<='9') return c-'0';
+  if(c>='a'&&c<='f') return c-'a'+10;
+  if(c>='A'&&c<='F') return c-'A'+10;
   return -1;
 }
-static bool usbDecodeHex(const String &hex, String &decoded, size_t maxBytes) {
-  if (hex.length() & 1 || hex.length() > 2 * maxBytes) return false;
-  decoded = "";
-  for (size_t i = 0; i < hex.length(); i += 2) {
-    int hi = usbHexDigit(hex[i]), lo = usbHexDigit(hex[i+1]);
-    if (hi < 0 || lo < 0) return false;
-    uint8_t c = (uint8_t)((hi << 4) | lo);
-    if (c == 0 || c == 10 || c == 13) return false; // NUL and newline disallowed
-    decoded += (char)c;
+static bool usbHexDecode(const String &hex,String &out) {
+  if(hex.length()>4000 || (hex.length()&1))return false;
+  out="";
+  if(!out.reserve(hex.length()/2+1))return false;
+  for(size_t i=0;i<hex.length();i+=2) {
+    int hi=usbHex(hex.charAt(i)),lo=usbHex(hex.charAt(i+1));
+    if(hi<0||lo<0)return false;
+    char c=(char)((hi<<4)|lo);
+    if(c==0||c=='\r')return false;
+    out+=c;
   }
   return true;
 }
-static void processUsbSetupLine(const String &line) {
-  if (line == "RDH14PING") {
-    Serial.println("RDH14:OK:READY");
-    return;
+static void usbEditorCommand(const String &line) {
+  if(!line.startsWith("RD16:"))return;
+  if(line=="RD16:PING"){Serial.println("RD16:OK:READY");return;}
+  if(line=="RD16:STATUS"){
+    Serial.print("RD16:STATUS:");Serial.println(statusJson());return;
   }
-  if (line == "RDH14STATUS") {
-    if (radioMode != MODE_WIFI_EDITOR) {
-      Serial.println("RDH14:ERROR:SWITCH_TO_WIFI_SETUP");
-      return;
+  if(line=="RD16:CONFIG"){
+    Serial.print("RD16:CONFIG:");Serial.println(configJson());return;
+  }
+  if(line.startsWith("RD16:PAGE:")) {
+    String p=line.substring(10);
+    if(p.length()!=1||p[0]<'0'||p[0]>'3'){
+      Serial.println("RD16:ERROR:BAD_PAGE");return;
     }
-    if (hotspotConfigured && WiFi.status() == WL_CONNECTED) {
-      Serial.print("RDH14:STATUS:CONNECTED:");
-      Serial.println(WiFi.localIP().toString());
-    } else if (hotspotConfigured) {
-      Serial.println("RDH14:STATUS:SEARCHING");
-    } else {
-      Serial.println("RDH14:STATUS:NOT_CONFIGURED");
+    currentPage=p[0]-'0';
+    pageChangedAt=millis();
+    phonePageHoldUntil=pageChangedAt+60000;
+    lastFrameAt=0;
+    Serial.println("RD16:OK:PAGE");return;
+  }
+  const bool save=line.startsWith("RD16:SAVE:");
+  const bool preview=line.startsWith("RD16:PREVIEW:");
+  if(!save&&!preview){Serial.println("RD16:ERROR:UNKNOWN");return;}
+  String body;
+  if(!usbHexDecode(line.substring(save?10:13),body)){
+    Serial.println("RD16:ERROR:BAD_PAYLOAD");return;
+  }
+  GaugeConfig next=cfg;
+  size_t at=0;
+  while(at<body.length()) {
+    int eol=body.indexOf('\n',at);
+    if(eol<0)eol=body.length();
+    String row=body.substring(at,eol);
+    row.trim();
+    if(row.length()) {
+      int eq=row.indexOf('=');
+      if(eq<1||!applyItem(next,row.substring(0,eq),row.substring(eq+1))){
+        Serial.println("RD16:ERROR:INVALID_SETTING");return;
+      }
     }
-    return;
+    at=eol+1;
   }
-  if (!line.startsWith("RDH14SET:")) return; // ignore other serial traffic
-  if (radioMode != MODE_WIFI_EDITOR) {
-    Serial.println("RDH14:ERROR:SWITCH_TO_WIFI_SETUP");
-    return;
+  if(next.coolantMax<=next.coolantMin||next.voltageMax<=next.voltageMin||
+      next.boostMax<=next.boostMin||next.redline>next.rpmMax){
+    Serial.println("RD16:ERROR:BAD_LIMITS");return;
   }
-  int delimiter = line.indexOf(':', 9);
-  if (delimiter < 0) {
-    Serial.println("RDH14:ERROR:FORMAT");
-    return;
-  }
-  String name, secret;
-  if (!usbDecodeHex(line.substring(9, delimiter), name, 32) ||
-      !usbDecodeHex(line.substring(delimiter + 1), secret, 63) ||
-      name.length() < 1 || secret.length() < 8 || secret.length() > 63) {
-    Serial.println("RDH14:ERROR:INVALID_CREDENTIAL_LENGTH_OR_ENCODING");
-    return;
-  }
-  Preferences p;
-  if (!p.begin("rdhotspot", false)) {
-    Serial.println("RDH14:ERROR:STORAGE");
-    return;
-  }
-  bool goodName = p.putString("ssid", name) == name.length();
-  bool goodPass = p.putString("pass", secret) == secret.length();
-  p.end();
-  if (!goodName || !goodPass) {
-    Serial.println("RDH14:ERROR:STORAGE");
-    return;
-  }
-  hotspotName = name;
-  hotspotPassword = secret;
-  hotspotConfigured = true;
-  hotspotWasConnected = false;
-  hotspotProvisionPending = true;
-  hotspotPendingAt = millis();
-  nextHotspotAttemptAt = millis();
-  Serial.println("RDH14:OK:SAVED");
+  cfg=next;
+  if(save)saveConfig();
+  lastFrameAt=0;
+  Serial.println(save?"RD16:OK:SAVED":"RD16:OK:PREVIEW");
 }
-static void pollUsbSetup() {
-  if (usbSetupUsed && millis() - usbSetupLastByteAt > 2500) usbSetupUsed = 0;
-  uint8_t budget = 100;
-  while (Serial.available() && budget--) {
-    int b = Serial.read();
-    if (b < 0) break;
-    usbSetupLastByteAt = millis();
-    if (b == '\r') continue;
-    if (b == '\n') {
-      usbSetupLine[usbSetupUsed] = 0;
-      if (usbSetupUsed) processUsbSetupLine(String(usbSetupLine));
-      usbSetupUsed = 0;
-    } else if (usbSetupUsed + 1 < sizeof(usbSetupLine)) {
-      usbSetupLine[usbSetupUsed++] = (char)b;
-    } else {
-      usbSetupUsed = 0;
-      Serial.println("RDH14:ERROR:COMMAND_TOO_LONG");
+static void serviceUsbEditor(){
+  if(usbEditorLine.length()&&(uint32_t)(millis()-usbEditorLastByteAt)>2500)
+    usbEditorLine="";
+  int budget=512;
+  while(Serial.available()>0&&budget--){
+    int b=Serial.read();
+    if(b<0)break;
+    usbEditorLastByteAt=millis();
+    if(b=='\r')continue;
+    if(b=='\n'){
+      if(usbEditorLine.length())usbEditorCommand(usbEditorLine);
+      usbEditorLine="";
+    }else if(usbEditorLine.length()<4200){
+      usbEditorLine+=(char)b;
+    }else{
+      usbEditorLine="";
+      Serial.println("RD16:ERROR:LINE_TOO_LONG");
     }
   }
 }
@@ -1493,7 +1355,6 @@ void setup() {
   Serial.printf("[BOOT] count=%lu reset=%d heap=%u\n", (unsigned long)rebootCount,
                 (int)lastResetReason, ESP.getFreeHeap());
   loadConfig();
-  loadHotspotConfig();
   // Automatic crash recovery: if enabling BT led to watchdog, panic, or
   // brownout, return to Wi-Fi-safe mode rather than rebooting endlessly.
   if (radioMode == MODE_BLUETOOTH_OBD &&
@@ -1544,11 +1405,8 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
-  pollUsbSetup();
-  if (radioMode == MODE_WIFI_EDITOR) {
-    server.handleClient();
-    serviceHotspot(now);
-  }
+  serviceUsbEditor();
+  if (radioMode == MODE_WIFI_EDITOR) server.handleClient();
   updateButton(now);
   if (radioMode == MODE_BLUETOOTH_OBD && bluetoothStarted) updateObd(now);
   renderScreen(now);
