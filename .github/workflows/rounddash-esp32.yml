@@ -66,6 +66,29 @@ jobs:
           assert len(image) > 0x11000 and image[0x1000] == 0xe9 and image[0x10000] == 0xe9
           print('Full image validated:',len(image),'bytes')
           PY
+      - name: Compile isolated Wi-Fi diagnostic firmware
+        shell: bash
+        run: |
+          arduino-cli compile -b esp32:esp32:esp32 --output-dir build_wifi \
+            --build-property "compiler.cpp.extra_flags=-DUSER_SETUP_LOADED -DGC9A01_DRIVER -DTFT_WIDTH=240 -DTFT_HEIGHT=240 -DTFT_MOSI=23 -DTFT_SCLK=18 -DTFT_CS=15 -DTFT_DC=2 -DTFT_RST=4 -DLOAD_GLCD -DLOAD_FONT2 -DSPI_FREQUENCY=40000000" \
+            RoundDash_WiFi_Radio_Test
+          python3 -m esptool --chip esp32 merge_bin -o RoundDash_WIFI_RADIO_TEST_0x0.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000 build_wifi/RoundDash_WiFi_Radio_Test.ino.bootloader.bin \
+            0x8000 build_wifi/RoundDash_WiFi_Radio_Test.ino.partitions.bin \
+            0xe000 ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/boot_app0.bin \
+            0x10000 build_wifi/RoundDash_WiFi_Radio_Test.ino.bin
+          python3 - <<'PY'
+          from pathlib import Path
+          img=Path('RoundDash_WIFI_RADIO_TEST_0x0.bin').read_bytes()
+          assert len(img)>0x10000 and img[0x1000]==0xe9 and img[0x10000]==0xe9
+          print('Verified diagnostic merged image size:',len(img))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RoundDash_WIFI_RADIO_TEST_0x0
+          path: RoundDash_WIFI_RADIO_TEST_0x0.bin
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         with:
           name: RoundDash_V6_FULL_MERGED
