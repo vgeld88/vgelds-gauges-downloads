@@ -21,6 +21,7 @@
 */
 
 #include <Arduino.h>
+#include <esp_system.h>
 #include <BluetoothSerial.h>
 #include <WiFi.h>
 #include <WebServer.h>
@@ -39,19 +40,24 @@
 // WPA2 password must contain at least 8 characters. Change for your own unit.
 static const char *AP_SSID = "RoundDash-ESP32";
 static const char *AP_PASSWORD = "rounddash826";
-// Wi-Fi recovery: the tested diagnostic WPA2 channel-1 startup is used here.
-// A short Wi-Fi-first setup period avoids BT inquiry traffic during pairing.
-static uint32_t wifiBootAt = 0;
-static uint32_t lastApJoinAt = 0;
+// V12 stability isolation: use the working Wi-Fi-only radio configuration
+// while editing, and use Bluetooth-only OBD mode while driving.
+// A 3-second BOOT-button hold changes modes and performs a deliberate reboot.
+enum RadioMode : uint8_t { MODE_WIFI_EDITOR = 0, MODE_BLUETOOTH_OBD = 1 };
+static uint8_t radioMode = MODE_WIFI_EDITOR;
 static bool bluetoothStarted = false;
 static bool wifiApReady = false;
 static volatile uint32_t apJoins = 0, apLeaves = 0;
-constexpr uint32_t WIFI_SETUP_WINDOW_MS = 120000UL;
-constexpr uint32_t WIFI_CLIENT_GRACE_MS = 20000UL;
+RTC_NOINIT_ATTR uint32_t rebootMagic;
+RTC_NOINIT_ATTR uint32_t rebootCount;
+static esp_reset_reason_t lastResetReason;
+static uint32_t startedAt = 0;
+static constexpr uint32_t BOOT_MAGIC = 0x52445731;
 
 constexpr bool USE_BOOT_BUTTON = true;
 constexpr uint32_t DEBOUNCE_MS = 35;
 constexpr uint32_t LONG_PRESS_MS = 700;
+constexpr uint32_t RADIO_SWITCH_PRESS_MS = 3000;
 
 constexpr uint32_t PID_SPACING_MS = 150;    // Minimum gap between PID sends
 constexpr uint32_t PID_TIMEOUT_MS = 1250;  // Advance when ECU does not reply
@@ -184,7 +190,27 @@ void updateButton(uint32_t now) {
       if (stablePressed) {
         pressedAt = now;
       } else {
-        changePage(elapsed(now, pressedAt, LONG_PRESS_MS) ? -1 : 1, now);
+        uint32_t heldMs = (uint32_t)(now - pressedAt);
+        if (heldMs >= RADIO_SWITCH_PRESS_MS) {
+          uint8_t next = (radioMode == MODE_WIFI_EDITOR) ? MODE_BLUETOOTH_OBD : MODE_WIFI_EDITOR;
+          Serial.printf("[MODE] Switching %s -> %s after BOOT hold %lu ms\n",
+                        radioMode == MODE_WIFI_EDITOR ? "WIFI" : "BT",
+                        next == MODE_WIFI_EDITOR ? "WIFI" : "BT",
+                        (unsigned long)heldMs);
+          Preferences modePreferences;
+          if (modePreferences.begin("rounddash", false)) {
+            modePreferences.putUChar("radiomode", next);
+            modePreferences.end();
+          }
+          tft.fillScreen(TFT_BLACK);
+          tft.setTextDatum(MC_DATUM);
+          tft.setTextColor(TFT_WHITE, TFT_BLACK);
+          tft.drawString(next == MODE_WIFI_EDITOR ? "WIFI SETUP MODE" : "BLUETOOTH DRIVE", 120, 115, 2);
+          delay(250);
+          ESP.restart();
+        } else {
+          changePage(heldMs >= LONG_PRESS_MS ? -1 : 1, now);
+        }
       }
     }
   }
@@ -785,6 +811,18 @@ static void renderTurboBurst(uint32_t now) {
   centerFit("BOOST "+String(boostPsi.value,1)+" PSI",199,1,cfg.foreground565,110);
 }
 
+static const char *resetText() {
+  switch (lastResetReason) {
+    case ESP_RST_POWERON: return "POWER";
+    case ESP_RST_SW: return "SOFTWARE";
+    case ESP_RST_PANIC: return "CRASH";
+    case ESP_RST_INT_WDT: return "INT WDT";
+    case ESP_RST_TASK_WDT: return "TASK WDT";
+    case ESP_RST_WDT: return "WATCHDOG";
+    case ESP_RST_BROWNOUT: return "BROWNOUT";
+    default: return "OTHER";
+  }
+}
 static void drawFooter() {
   const char* message="BT CONNECTING";
   switch(linkState){
@@ -794,18 +832,22 @@ static void drawFooter() {
     case LinkState::POLLING: message="OBD CONNECTED";break;
     case LinkState::BT_FAILURE: message="BT INIT ERROR";break;
   }
-  // Show connection status even with no OBD adapter. This is useful when
-  // diagnosing Samsung Wi-Fi association without a USB serial monitor.
-  if (!wifiApReady)
-    centerFit("WIFI AP FAILED",211,1,C_RED,135);
-  else if (WiFi.softAPgetStationNum() > 0)
-    centerFit(String("WIFI PHONE ") + WiFi.softAPgetStationNum(),211,1,C_GREEN,135);
-  else if (!bluetoothStarted)
-    centerFit("WIFI READY - JOIN",211,1,C_GREEN,135);
-  else if (apLeaves != 0)
-    centerFit(String("WIFI LEFT ") + apLeaves,211,1,C_ORANGE,135);
-  else
-    centerFit(message,211,1,linkState==LinkState::POLLING?C_GREEN:C_GREY,135);
+  if (radioMode == MODE_BLUETOOTH_OBD) {
+    centerFit(String("DRIVE: ") + message, 211, 1,
+              linkState==LinkState::POLLING ? C_GREEN : C_ORANGE, 200);
+  } else if (!wifiApReady) {
+    centerFit("WIFI AP FAILED", 211, 1, C_RED, 160);
+  } else if (WiFi.softAPgetStationNum() > 0) {
+    centerFit(String("WIFI PHONE ") + WiFi.softAPgetStationNum(),211,1,C_GREEN,140);
+  } else if (apLeaves != 0) {
+    centerFit(String("WIFI LEFT ") + apLeaves,211,1,C_ORANGE,140);
+  } else {
+    centerFit("WIFI READY - JOIN",211,1,C_GREEN,140);
+  }
+  if ((uint32_t)(millis()-startedAt) < 30000UL) {
+    centerFit(String("BOOT ") + rebootCount + " " + resetText(), 25, 1,
+              lastResetReason == ESP_RST_BROWNOUT ? C_RED : C_ORANGE, 170);
+  }
   for(int i=0;i<4;i++)frame.fillCircle(102+12*i,226,2,i==currentPage?cfg.accent565:C_DIM);
 }
 
@@ -877,6 +919,10 @@ void loadConfig() {
   cfg.romId = preferences.getString("romid", cfg.romId);
   cfg.ecuId = preferences.getString("ecuid", cfg.ecuId);
   cfg.obdName = preferences.getString("obdname", cfg.obdName);
+  // This project is paired with the user's OBDLink LX, not a generic "OBDII".
+  if (cfg.obdName == "OBDII") cfg.obdName = "OBDLink LX";
+  radioMode = preferences.getUChar("radiomode", MODE_WIFI_EDITOR);
+  if (radioMode != MODE_BLUETOOTH_OBD) radioMode = MODE_WIFI_EDITOR;
   cfg.obdPin = preferences.getString("obdpin", cfg.obdPin);
   preferences.end();
 }
@@ -966,6 +1012,10 @@ void handleStatus() {
   out += ",\"wifiApReady\":" + String(wifiApReady ? "true" : "false");
   out += ",\"wifiChannel\":1";
   out += ",\"bluetoothStarted\":" + String(bluetoothStarted ? "true" : "false");
+  out += ",\"radioMode\":\"wifi_setup\"";
+  out += ",\"bootCount\":" + String(rebootCount);
+  out += ",\"resetReason\":" + jsonQuote(resetText());
+  out += ",\"uptimeMs\":" + String((uint32_t)(millis() - startedAt));
   out += ",\"heap\":" + String(ESP.getFreeHeap());
   out += ",\"wifiClients\":" + String(WiFi.softAPgetStationNum());
   out += ",\"wifiJoins\":" + String((unsigned long)apJoins);
@@ -1166,7 +1216,6 @@ void handlePage() {
 void onSoftAPEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
     apJoins++;
-    lastApJoinAt = millis();
     Serial.printf("[WIFI] phone associated; total joins=%lu\n", (unsigned long)apJoins);
   } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
     apLeaves++;
@@ -1182,7 +1231,6 @@ void initHttp() {
   delay(50); // one-time Wi-Fi radio stabilization, not in loop()
   WiFi.onEvent(onSoftAPEvent);
   wifiApReady = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4);
-  wifiBootAt = millis();
   Serial.printf("[WIFI] AP start=%s ssid=%s channel=1 ip=%s\n",
                 wifiApReady ? "YES" : "NO", AP_SSID, WiFi.softAPIP().toString().c_str());
   if (!wifiApReady) Serial.println("ERROR: Could not start Wi-Fi AP");
@@ -1199,6 +1247,12 @@ void initHttp() {
 // -------------------------- ARDUINO ------------------------------
 void setup() {
   Serial.begin(115200);
+  startedAt = millis();
+  lastResetReason = esp_reset_reason();
+  if (rebootMagic != BOOT_MAGIC) { rebootMagic = BOOT_MAGIC; rebootCount = 0; }
+  rebootCount++;
+  Serial.printf("[BOOT] count=%lu reset=%d heap=%u\n", (unsigned long)rebootCount,
+                (int)lastResetReason, ESP.getFreeHeap());
   loadConfig();
   // Migrate V1 numeric-only positions to the V2 analog dial layout.
   if(cfg.valueY<152 || cfg.titleY<63 || cfg.unitY<178){
@@ -1213,36 +1267,32 @@ void setup() {
   frameReady = (frame.createSprite(TFT_W, TFT_H) != nullptr);
   if (!frameReady) Serial.println("ERROR: Could not allocate 240x240 sprite");
 
-  initHttp();
   pageChangedAt = millis();
-  // Hold BT inquiry during initial phone association, using the tested AP radio setup.
-  // After initial pairing or a two-minute grace window, OBD mode starts normally.
-  linkState = LinkState::RETRY_WAIT;
-  retryAt = millis();
-}
-
-void loop() {
-  uint32_t now = millis();
-  server.handleClient();
-  bool phoneSettled = WiFi.softAPgetStationNum() > 0 &&
-                      lastApJoinAt != 0 &&
-                      (uint32_t)(now - lastApJoinAt) >= WIFI_CLIENT_GRACE_MS;
-  bool bootGraceElapsed = (uint32_t)(now - wifiBootAt) >= WIFI_SETUP_WINDOW_MS;
-  if (!bluetoothStarted && (phoneSettled || bootGraceElapsed)) {
+  if (radioMode == MODE_WIFI_EDITOR) {
+    // Identical radio start sequence to the WPA2 diagnostic which joined cleanly.
+    initHttp();
+    Serial.println("[MODE] WIFI editor ready, Bluetooth stack intentionally OFF.");
+  } else {
+    WiFi.mode(WIFI_OFF);
+    Serial.println("[MODE] Bluetooth-only OBD drive; Wi-Fi intentionally OFF.");
     bluetoothStarted = true;
-    // Master mode is essential; most ELM327 adapters are SPP slaves.
     bluetoothReady = bt.begin("ESP32-OBD-DASH", true);
     if (bluetoothReady) {
       bt.setPin(cfg.obdPin.c_str());
       linkState = LinkState::RETRY_WAIT;
-      retryAt = now - RECONNECT_MS;
+      retryAt = millis() - RECONNECT_MS;
     } else {
       linkState = LinkState::BT_FAILURE;
-      Serial.println("ERROR: Bluetooth Classic could not start");
+      Serial.println("ERROR: Bluetooth Classic failed to initialize.");
     }
   }
+}
+
+void loop() {
+  uint32_t now = millis();
+  if (radioMode == MODE_WIFI_EDITOR) server.handleClient();
   updateButton(now);
-  if (bluetoothStarted) updateObd(now);
+  if (radioMode == MODE_BLUETOOTH_OBD && bluetoothStarted) updateObd(now);
   renderScreen(now);
   // Intentionally no delay(): polling, UI and input are millis()-driven.
 }
