@@ -64,11 +64,25 @@ constexpr uint32_t PID_TIMEOUT_MS = 1250;  // Advance when ECU does not reply
 constexpr uint32_t INIT_TIMEOUT_MS = 2600;
 constexpr uint32_t RECONNECT_MS = 5000;
 constexpr uint32_t DATA_STALE_MS = 4000;
-constexpr uint32_t FRAME_MS = 50;         // Up to ~20 FPS; no delay()
+constexpr uint32_t FRAME_MS = 90;     // Three physical screens: reduce SPI duty cycle         // Up to ~20 FPS; no delay()
 
 constexpr int TFT_W = 240, TFT_H = 240;
 constexpr int CX = 120, CY = 120;
 constexpr uint8_t BUTTON_PIN = 0;
+// V23: THREE *PHYSICAL* GC9A01 displays on ONE SPI bus.
+// Shared MOSI=23 SCLK=18 DC=2 RESET=4, separate CS: 15/16/17.
+// The full firmware MUST compile with TFT_CS=-1 and TFT_RST=-1 so
+// TFT_eSPI does not override the per-screen manual chip selection.
+static constexpr uint8_t PHYSICAL_SCREENS=3;
+static constexpr uint8_t PHYSICAL_CS[PHYSICAL_SCREENS]={15,16,17};
+static constexpr uint8_t PHYSICAL_RESET_PIN=4;
+static void deselectAllScreens() {
+  for(uint8_t i=0;i<PHYSICAL_SCREENS;i++)digitalWrite(PHYSICAL_CS[i],HIGH);
+}
+static void selectScreen(uint8_t i) {
+  deselectAllScreens();
+  if(i<PHYSICAL_SCREENS)digitalWrite(PHYSICAL_CS[i],LOW);
+}
 
 
 static constexpr uint16_t C_GREY = 0x8410;
@@ -100,6 +114,12 @@ struct GaugeConfig {
   uint8_t tripleSlots[8][3] = {
     {0,1,2},{0,3,4},{5,6,0},{3,7,8},
     {0,3,5},{1,4,2},{0,6,7},{3,9,10}
+  };
+  // Full-size dial design for each physical screen, saved per set.
+  // 0 OEM STI red, 1 Ghost cyan, 2 Rally blue, 3 Amber motorsport.
+  uint8_t tripleStyles[8][3] = {
+    {1,0,0},{1,0,0},{0,0,1},{0,3,0},
+    {1,0,1},{0,1,0},{1,0,3},{0,2,0}
   };
   uint32_t cycleMs = 7000;
   String rpmTitle = "ENGINE SPEED";
@@ -254,10 +274,15 @@ void updateButton(uint32_t now) {
             modePreferences.putUChar("radiomode", next);
             modePreferences.end();
           }
-          tft.fillScreen(TFT_BLACK);
-          tft.setTextDatum(MC_DATUM);
-          tft.setTextColor(TFT_WHITE, TFT_BLACK);
-          tft.drawString(next == MODE_WIFI_EDITOR ? "WIFI SETUP MODE" : "BLUETOOTH DRIVE", 120, 115, 2);
+          for(uint8_t screen=0;screen<PHYSICAL_SCREENS;screen++) {
+            selectScreen(screen);
+            tft.fillScreen(TFT_BLACK);
+            tft.setTextDatum(MC_DATUM);
+            tft.setTextColor(TFT_WHITE,TFT_BLACK);
+            tft.drawString(next == MODE_WIFI_EDITOR ?
+              "WIFI SETUP MODE" : "BLUETOOTH DRIVE",120,115,2);
+            deselectAllScreens();
+          }
           delay(250);
           ESP.restart();
         } else {
@@ -1194,77 +1219,120 @@ static void drawFooter() {
 }
 
 
-// ----------------- V22 THREE INDEPENDENT MINI GAUGES ----------------
-// Round 240px GC9A01: 2 dials upper row, 1 dial centred below.
-// All labels and numbers are real ECU readings, or "--" if unavailable.
-static void miniGaugeText(String value,int cx,int cy,int size,uint16_t color,int maxW){
-  frame.setTextFont(1);frame.setTextDatum(MC_DATUM);frame.setTextColor(color);
-  size=constrain(size,1,3);
-  while(size>1 && (int)value.length()*size*6>maxW)size--;
-  frame.setTextSize(size);
-  frame.drawString(value,cx,cy);frame.setTextSize(1);
-}
-static void tripleDial(uint8_t slot,uint8_t id,uint32_t now){
-  const int x=slot==0?76:slot==1?164:120;
-  const int y=slot==2?164:83;
-  Reading *p=tripleReading(id);
-  const bool valid=p&&fresh(*p,now);
-  float lower=0,upper=1;tripleRange(id,lower,upper);
-  const float ratio=valid?clampFloat((p->value-lower)/max(0.01f,upper-lower),0,1):0;
-  const uint16_t accent=id==0?0xEB2C:id==4?0x3EFF:id==7?0xFCE5:cfg.accent565;
-  frame.fillCircle(x,y,40,0x39EC);
-  frame.fillCircle(x,y,38,0x0863);
-  frame.fillCircle(x,y,35,0x0000);
-  for(int t=0;t<=40;t++){
-    const float f=t/40.0f;
-    const float a=(157.5f+225.0f*f)*DEG_TO_RAD;
-    const int px=x+(int)lroundf(cosf(a)*33);
-    const int py=y+(int)lroundf(sinf(a)*33);
-    frame.fillCircle(px,py,valid&&f<=ratio?2:1,valid&&f<=ratio?accent:0x39A8);
-  }
-  if(valid){
-    const float a=(157.5f+225.0f*ratio)*DEG_TO_RAD;
-    frame.fillCircle(x+(int)lroundf(cosf(a)*33),
-                     y+(int)lroundf(sinf(a)*33),3,0xFFFF);
-  }
-  miniGaugeText(tripleLabel(id),x,y-16,1,0xBDF7,66);
-  String label="--";
-  if(valid) {
-    if(id==1||id==3||id==10||id==13||id==14)
-      label=String((int)lroundf(p->value));
-    else if(id==4||id==7||id==8||id==11||id==12)
-      label=String(p->value,2);
-    else label=String(p->value,1);
-  }
-  miniGaugeText(label,x,y+1,2,0xFFFF,67);
-  miniGaugeText(tripleUnit(id),x,y+19,1,accent,55);
-}
-static void tripleDashboard(uint32_t now){
+// ---------------- V23 THREE REAL, SEPARATE ROUND DISPLAYS ----------------
+// Three physical 240x240 GC9A01 boards, each uses the whole round screen.
+// The screen numbers follow their individual CS lines (15 / 16 / 17).
+static void physicalDial(uint8_t screen,uint8_t id,uint8_t style,uint32_t now) {
+  Reading *r=tripleReading(id);
+  const bool live=r && fresh(*r,now);
+  float lo=0,hi=1;tripleRange(id,lo,hi);
+  const float p=live?clampFloat((r->value-lo)/max(.1f,hi-lo),0,1):0;
+  // Styles 0 STI Red, 1 Ghost cyan, 2 Rally blue, 3 Amber.
+  const uint16_t accent=style==1?0x4DFF:style==2?0x349F:
+                        style==3?0xFC62:0xF16A;
+  const uint16_t secondary=style==1?0x1A5F:style==2?0x1417:
+                           style==3?0xB400:0x7800;
+  const uint16_t rim=style==1?0x6B6D:0xA4F2;
   frame.fillSprite(0x0000);
-  frame.drawCircle(CX,CY,118,0x6B4D);
-  frame.drawCircle(CX,CY,115,0x2106);
-  miniGaugeText(String("SET ")+(currentPage+1)+" / "+pageTotal(),
-                CX,29,1,0xAD55,125);
-  for(uint8_t i=0;i<3;i++)
-    tripleDial(i,cfg.tripleSlots[currentPage][i],now);
+  frame.fillCircle(CX,CY,118,rim);
+  frame.fillCircle(CX,CY,115,0x18C6);
+  frame.fillCircle(CX,CY,111,0x0821);
+  frame.fillCircle(CX,CY,107,0x0000);
+  frame.drawCircle(CX,CY,109,0x4A69);
+  // 240-degree instrument sweep. No fake live reading when car is offline.
+  for(int step=0;step<=120;step++){
+    const float f=step/120.0f;
+    const float a=(150.0f+f*240.0f)*DEG_TO_RAD;
+    const float co=cosf(a),si=sinf(a);
+    const int x=CX+(int)lroundf(co*95.0f);
+    const int y=CY+(int)lroundf(si*95.0f);
+    uint16_t color=accent;
+    if(style==1)color=f<.65f?accent:f<.8f?0xFCA0:0xF987;
+    else if(style==3)color=f<.8f?0xFCA0:0xF987;
+    else if(f>.82f)color=0xF987;
+    if(style==1) {
+      // Solid, multi-tone Ghost Sweep arc like the user's working design.
+      frame.fillCircle(x,y,3,color);
+    } else {
+      const bool on=live&&f<=p;
+      frame.fillCircle(x,y,on?3:2,on?color:secondary);
+    }
+  }
+  // Independent pointer/reading on each round TFT, not one sprite with 3 dials.
+  if(live){
+    const float a=(150.0f+240.0f*p)*DEG_TO_RAD;
+    const int x=CX+(int)lroundf(cosf(a)*95.0f);
+    const int y=CY+(int)lroundf(sinf(a)*95.0f);
+    frame.fillCircle(x,y,7,style==1?0xFFFF:accent);
+    frame.fillCircle(x,y,3,0xFFFF);
+  }
+  frame.setTextDatum(MC_DATUM);
+  frame.setTextFont(1);
+  const int intervals=id==3?8:5;
+  for(int t=0;t<=intervals;t++){
+    const float fraction=(float)t/intervals;
+    const float a=(150.0f+240.0f*fraction)*DEG_TO_RAD;
+    const int x=CX+(int)lroundf(cosf(a)*70);
+    const int y=CY+(int)lroundf(sinf(a)*70);
+    float v=lo+(hi-lo)*fraction;
+    String label=id==3?String((int)lroundf(v/1000)):
+                 id==4?String(v,1):String((int)lroundf(v));
+    frame.setTextColor(fraction>=.8f?accent:0x8410);
+    frame.setTextSize(1);
+    frame.drawString(label,x,y);
+  }
+  const String title=tripleLabel(id);
+  centerFit(title,52,2,accent,157);
+  String number="--";
+  if(live){
+    if(id==1||id==3||id==10||id==13||id==14)
+      number=String((int)lroundf(r->value));
+    else if(id==4||id==7||id==8||id==11||id==12||id==15)
+      number=String(r->value,2);
+    else number=String(r->value,1);
+  }
+  centerFit(number,125,5,0xFFFF,170);
+  centerFit(tripleUnit(id),168,2,0xCE99,110);
+  frame.drawFastHLine(67,182,106,0x39C7);
+  centerFit(live?(ssmLive?"SUBARU SSM":"ECU DATA"):"WAITING FOR ECU",194,1,
+            live?C_GREEN:0x9CD3,148);
+  // Short unobtrusive set marker, not one of three small dial drawings.
+  centerFit("SET "+String(currentPage+1)+"   GAUGE "+String(screen+1),212,1,
+            0x8B6E,164);
+  const int count=pageTotal();
+  const int first=120-(count-1)*6;
+  for(int i=0;i<count;i++)
+    frame.fillCircle(first+12*i,226,2,i==currentPage?accent:C_DIM);
 }
-
 static void renderScreen(uint32_t now) {
   if(!frameReady)return;
   if(lastFrameAt!=0&&!elapsed(now,lastFrameAt,FRAME_MS))return;
   lastFrameAt=now;
   if(cfg.tripleMode) {
-    tripleDashboard(now);
-    drawFooter();
-  } else {
-    dialBase();
-    uint8_t layout = currentPage==0?cfg.rpmLayout:currentPage==1?cfg.coolantLayout:currentPage==2?cfg.voltageLayout:cfg.boostLayout;
-    if(layout==0)renderInstrument(now);
-    else renderV3Variant(now,layout);
-    if(layout!=8) renderTurboBurst(now);
-    drawFooter();
+    for(uint8_t screen=0;screen<PHYSICAL_SCREENS;screen++){
+      const uint8_t id=cfg.tripleSlots[currentPage][screen];
+      const uint8_t style=cfg.tripleStyles[currentPage][screen];
+      physicalDial(screen,id,style,now);
+      selectScreen(screen);
+      frame.pushSprite(0,0);
+      deselectAllScreens();
+    }
+    return;
   }
-  frame.pushSprite(0,0);
+  // Legacy mode shows its one full-size dial identically on all 3 screens.
+  dialBase();
+  const uint8_t page=currentPage%4;
+  uint8_t layout=page==0?cfg.rpmLayout:page==1?cfg.coolantLayout:
+                 page==2?cfg.voltageLayout:cfg.boostLayout;
+  if(layout==0)renderInstrument(now);
+  else renderV3Variant(now,layout);
+  if(layout!=8)renderTurboBurst(now);
+  drawFooter();
+  for(uint8_t screen=0;screen<PHYSICAL_SCREENS;screen++){
+    selectScreen(screen);
+    frame.pushSprite(0,0);
+    deselectAllScreens();
+  }
 }
 
 // ------------------ WI-FI / LIVE EDITOR PROTOCOL ------------------
@@ -1302,6 +1370,13 @@ void loadConfig() {
     }
   }
   if(currentPage>=pageTotal())currentPage=0;
+  for(uint8_t i=0;i<8;i++){
+    const String k=String("styles")+i;
+    uint8_t t[3];
+    if(tripleTuple(preferences.getString(k.c_str(),""),t) &&
+       t[0]<=3&&t[1]<=3&&t[2]<=3)
+      for(uint8_t j=0;j<3;j++)cfg.tripleStyles[i][j]=t[j];
+  }
   cfg.cycleMs = preferences.getUInt("cyclems", cfg.cycleMs);
   cfg.rpmTitle = preferences.getString("rpmtitle", cfg.rpmTitle);
   cfg.coolantTitle = preferences.getString("ctitle", cfg.coolantTitle);
@@ -1365,6 +1440,13 @@ void saveConfig() {
       String(cfg.tripleSlots[i][1])+","+String(cfg.tripleSlots[i][2]);
     preferences.putString(key.c_str(),val);
   }
+  for(uint8_t i=0;i<8;i++){
+    String key=String("styles")+i;
+    String value=String(cfg.tripleStyles[i][0])+","+
+                 String(cfg.tripleStyles[i][1])+","+
+                 String(cfg.tripleStyles[i][2]);
+    preferences.putString(key.c_str(),value);
+  }
   preferences.putUInt("cyclems", cfg.cycleMs);
   preferences.putString("rpmtitle", cfg.rpmTitle);
   preferences.putString("ctitle", cfg.coolantTitle);
@@ -1427,7 +1509,7 @@ void sendJson(int status, const String &body) {
 
 String statusJson() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"22.0-triple-dash\",\"protocol\":";
+  String out = "{\"ok\":true,\"fw\":\"23.0-three-physical-screens\",\"protocol\":";
   out += ssmLive ? "\"Subaru_SSM_CAN_A8\"" : "\"OBD2_Mode01\"";
   out += ",\"ssmStreaming\":";
   out += ssmLive ? "true" : "false";
@@ -1504,6 +1586,10 @@ String configJson() {
   out += ",\"tripleMode\":" + String(cfg.tripleMode?"true":"false");
   out += ",\"tripleCount\":" + String(cfg.tripleCount);
   for(uint8_t i=0;i<8;i++) {
+    out+=",\"styles"+String(i)+"\":"+jsonQuote(
+      String(cfg.tripleStyles[i][0])+","+
+      String(cfg.tripleStyles[i][1])+","+
+      String(cfg.tripleStyles[i][2]));
     out+=",\"tri"+String(i)+"\":"+jsonQuote(
       String(cfg.tripleSlots[i][0])+","+
       String(cfg.tripleSlots[i][1])+","+
@@ -1593,6 +1679,14 @@ static bool applyItem(GaugeConfig &next, const String &key, String value) {
   else if(key=="tripleCount"){
     if(!numberInRange(value,1,8,n)||n!=(int)n)return false;
     next.tripleCount=(uint8_t)n;
+  }
+  else if(key.length()==7 && key.startsWith("styles") &&
+          key.charAt(6)>='0'&&key.charAt(6)<='7'){
+    uint8_t tuple[3];
+    if(!tripleTuple(value,tuple))return false;
+    if(tuple[0]>3||tuple[1]>3||tuple[2]>3)return false;
+    uint8_t i=(uint8_t)(key.charAt(6)-'0');
+    for(uint8_t j=0;j<3;j++)next.tripleStyles[i][j]=tuple[j];
   }
   else if(key.length()==4 && key.startsWith("tri") &&
           key.charAt(3)>='0'&&key.charAt(3)<='7'){
@@ -1846,9 +1940,25 @@ void setup() {
   }
   if (USE_BOOT_BUTTON) pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  tft.init();
-  tft.setRotation(0);
-  tft.fillScreen(cfg.background565);
+  // All TFT CS lines must be HIGH before any SPI transaction.
+  for(uint8_t i=0;i<PHYSICAL_SCREENS;i++){
+    pinMode(PHYSICAL_CS[i],OUTPUT);
+    digitalWrite(PHYSICAL_CS[i],HIGH);
+  }
+  pinMode(PHYSICAL_RESET_PIN,OUTPUT);
+  digitalWrite(PHYSICAL_RESET_PIN,LOW);
+  delay(35);
+  digitalWrite(PHYSICAL_RESET_PIN,HIGH);
+  delay(160);
+  // Library is compiled TFT_CS=-1 TFT_RST=-1 so it cannot change another
+  // display's chip-select or reset after we select one of the 3.
+  for(uint8_t i=0;i<PHYSICAL_SCREENS;i++){
+    selectScreen(i);
+    tft.init();
+    tft.setRotation(0);
+    tft.fillScreen(cfg.background565);
+    deselectAllScreens();
+  }
   frame.setColorDepth(8);
   frameReady = (frame.createSprite(TFT_W, TFT_H) != nullptr);
   if (!frameReady) Serial.println("ERROR: Could not allocate 240x240 sprite");
