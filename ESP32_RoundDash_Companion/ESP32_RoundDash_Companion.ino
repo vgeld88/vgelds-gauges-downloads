@@ -1292,6 +1292,16 @@ void loadConfig() {
   cfg.valueY = preferences.getInt("valuey", cfg.valueY);
   cfg.unitY = preferences.getInt("unity", cfg.unitY);
   cfg.autoCycle = preferences.getBool("cycle", cfg.autoCycle);
+  cfg.tripleMode = preferences.getBool("trimode",cfg.tripleMode);
+  cfg.tripleCount=(uint8_t)constrain(preferences.getInt("tricount",cfg.tripleCount),1,8);
+  for(uint8_t i=0;i<8;i++){
+    const String key=String("tri")+i;
+    uint8_t slots[3];
+    if(tripleTuple(preferences.getString(key.c_str(),""),slots)){
+      for(uint8_t j=0;j<3;j++)cfg.tripleSlots[i][j]=slots[j];
+    }
+  }
+  if(currentPage>=pageTotal())currentPage=0;
   cfg.cycleMs = preferences.getUInt("cyclems", cfg.cycleMs);
   cfg.rpmTitle = preferences.getString("rpmtitle", cfg.rpmTitle);
   cfg.coolantTitle = preferences.getString("ctitle", cfg.coolantTitle);
@@ -1347,6 +1357,14 @@ void saveConfig() {
   preferences.putInt("valuey", cfg.valueY);
   preferences.putInt("unity", cfg.unitY);
   preferences.putBool("cycle", cfg.autoCycle);
+  preferences.putBool("trimode",cfg.tripleMode);
+  preferences.putInt("tricount",cfg.tripleCount);
+  for(uint8_t i=0;i<8;i++) {
+    const String key=String("tri")+i;
+    const String val=String(cfg.tripleSlots[i][0])+","+
+      String(cfg.tripleSlots[i][1])+","+String(cfg.tripleSlots[i][2]);
+    preferences.putString(key.c_str(),val);
+  }
   preferences.putUInt("cyclems", cfg.cycleMs);
   preferences.putString("rpmtitle", cfg.rpmTitle);
   preferences.putString("ctitle", cfg.coolantTitle);
@@ -1409,7 +1427,7 @@ void sendJson(int status, const String &body) {
 
 String statusJson() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"21.0-vgelds-ssm\",\"protocol\":";
+  String out = "{\"ok\":true,\"fw\":\"22.0-triple-dash\",\"protocol\":";
   out += ssmLive ? "\"Subaru_SSM_CAN_A8\"" : "\"OBD2_Mode01\"";
   out += ",\"ssmStreaming\":";
   out += ssmLive ? "true" : "false";
@@ -1424,6 +1442,8 @@ String statusJson() {
   out += ",\"bt\":";
   out += (linkState==LinkState::POLLING||linkState==LinkState::SSM_POLLING) && bt.connected(0) ? "true" : "false";
   out += ",\"page\":" + String(currentPage);
+  out += ",\"tripleMode\":" + String(cfg.tripleMode?"true":"false");
+  out += ",\"tripleCount\":" + String(cfg.tripleCount);
   out += ",\"wifiApReady\":" + String(wifiApReady ? "true" : "false");
   out += ",\"wifiChannel\":1";
   out += ",\"bluetoothStarted\":" + String(bluetoothStarted ? "true" : "false");
@@ -1481,6 +1501,14 @@ String configJson() {
   out += ",\"valueY\":" + String(cfg.valueY);
   out += ",\"unitY\":" + String(cfg.unitY);
   out += ",\"autoCycle\":" + String(cfg.autoCycle ? "true" : "false");
+  out += ",\"tripleMode\":" + String(cfg.tripleMode?"true":"false");
+  out += ",\"tripleCount\":" + String(cfg.tripleCount);
+  for(uint8_t i=0;i<8;i++) {
+    out+=",\"tri"+String(i)+"\":"+jsonQuote(
+      String(cfg.tripleSlots[i][0])+","+
+      String(cfg.tripleSlots[i][1])+","+
+      String(cfg.tripleSlots[i][2]));
+  }
   out += ",\"cycleMs\":" + String(cfg.cycleMs);
   out += ",\"rpmTitle\":" + jsonQuote(cfg.rpmTitle);
   out += ",\"coolantTitle\":" + jsonQuote(cfg.coolantTitle);
@@ -1558,6 +1586,21 @@ static bool applyItem(GaugeConfig &next, const String &key, String value) {
   else if (key == "titleY") { if (!numberInRange(value, 63, 90, n)) return false; next.titleY = (int)n; }
   else if (key == "valueY") { if (!numberInRange(value, 152, 174, n)) return false; next.valueY = (int)n; }
   else if (key == "unitY") { if (!numberInRange(value, 178, 199, n)) return false; next.unitY = (int)n; }
+  else if(key=="tripleMode") {
+    if(value!="true"&&value!="false")return false;
+    next.tripleMode=value=="true";
+  }
+  else if(key=="tripleCount"){
+    if(!numberInRange(value,1,8,n)||n!=(int)n)return false;
+    next.tripleCount=(uint8_t)n;
+  }
+  else if(key.length()==4 && key.startsWith("tri") &&
+          key.charAt(3)>='0'&&key.charAt(3)<='7'){
+    uint8_t tuple[3];
+    if(!tripleTuple(value,tuple))return false;
+    uint8_t i=(uint8_t)(key.charAt(3)-'0');
+    for(uint8_t j=0;j<3;j++)next.tripleSlots[i][j]=tuple[j];
+  }
   else if (key == "autoCycle") { if (value != "true" && value != "false") return false; next.autoCycle = value == "true"; }
   else if (key == "cycleMs") { if (!numberInRange(value, 3000, 20000, n)) return false; next.cycleMs = (uint32_t)n; }
   else if (key == "rpmTitle") { if (!safeLabel(value, 20)) return false; next.rpmTitle = value; }
@@ -1624,6 +1667,7 @@ void handleWriteConfig(bool persist) {
   }
   bool obdChanged = next.obdName != cfg.obdName || next.obdPin != cfg.obdPin;
   cfg = next;
+  if(currentPage>=pageTotal())currentPage=0;
   if (persist) saveConfig(); // preview editing NEVER writes NVS/flash
   lastFrameAt = 0;
   sendJson(200, String("{\"ok\":true,\"message\":") +
@@ -1633,11 +1677,12 @@ void handleWriteConfig(bool persist) {
 
 void handlePage() {
   String s = server.arg("plain"); s.trim();
-  if (s == "page=0" || s == "page=1" || s == "page=2" || s == "page=3") {
+  if(s.length()==6 && s.startsWith("page=") &&
+     s.charAt(5)>='0' && s.charAt(5)<'0'+pageTotal()) {
     currentPage = s.charAt(5) - '0';
     pageChangedAt = millis(); phonePageHoldUntil = pageChangedAt + 60000; lastFrameAt = 0;
     sendJson(200, "{\"ok\":true}");
-  } else sendJson(400, "{\"ok\":false,\"message\":\"Page must be 0..3\"}");
+  } else sendJson(400, "{\"ok\":false,\"message\":\"Page outside configured dashboard sets\"}");
 }
 
 void onSoftAPEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
@@ -1709,7 +1754,7 @@ static void usbEditorCommand(const String &line) {
   }
   if(line.startsWith("RD16:PAGE:")) {
     String p=line.substring(10);
-    if(p.length()!=1||p[0]<'0'||p[0]>'3'){
+    if(p.length()!=1||p[0]<'0'||p[0]>=(char)('0'+pageTotal())){
       Serial.println("RD16:ERROR:BAD_PAGE");return;
     }
     currentPage=p[0]-'0';
