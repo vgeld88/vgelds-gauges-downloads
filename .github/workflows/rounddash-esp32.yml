@@ -1,0 +1,101 @@
+name: Build RoundDash GC9A01 ESP32 Firmware
+on:
+  push:
+    branches:
+      - rounddash-build-esp32
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  firmware:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: arduino/setup-arduino-cli@v2
+      - name: Install Xtensa toolchain and TFT library
+        shell: bash
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32@2.0.17
+          arduino-cli lib install "TFT_eSPI@2.5.43"
+      - name: Compile GC9A01 test firmware
+        shell: bash
+        run: |
+          arduino-cli compile -b esp32:esp32:esp32 --output-dir build \
+            --build-property "compiler.cpp.extra_flags=-DUSER_SETUP_LOADED -DGC9A01_DRIVER -DTFT_WIDTH=240 -DTFT_HEIGHT=240 -DTFT_MOSI=23 -DTFT_SCLK=18 -DTFT_CS=15 -DTFT_DC=2 -DTFT_RST=4 -DLOAD_GLCD -DLOAD_FONT2 -DLOAD_FONT4 -DSPI_FREQUENCY=40000000" \
+            RoundDash_First_Screen_Test
+          ls -la build
+      - name: Merge entire 0x0 firmware image for RoundDash Android USB flasher
+        shell: bash
+        run: |
+          python3 -m pip install --user "esptool==4.7.0"
+          python3 -m esptool --chip esp32 merge_bin -o RoundDash_GC9A01_DEMO_MERGED.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000 build/RoundDash_First_Screen_Test.ino.bootloader.bin \
+            0x8000 build/RoundDash_First_Screen_Test.ino.partitions.bin \
+            0xe000 ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/boot_app0.bin \
+            0x10000 build/RoundDash_First_Screen_Test.ino.bin
+          test "$(stat -c %s RoundDash_GC9A01_DEMO_MERGED.bin)" -gt 69632
+          python3 - <<'PY'
+          from pathlib import Path
+          image=Path('RoundDash_GC9A01_DEMO_MERGED.bin').read_bytes()
+          assert image[0x1000] == 0xe9
+          assert image[0x10000] == 0xe9
+          print('Merged image verified, bytes:',len(image))
+          PY
+      - name: Compile complete RoundDash V6 app-compatible firmware
+        shell: bash
+        run: |
+          arduino-cli compile -b esp32:esp32:esp32:PartitionScheme=huge_app --output-dir build_full \
+            --build-property "compiler.cpp.extra_flags=-DUSER_SETUP_LOADED -DGC9A01_DRIVER -DTFT_WIDTH=240 -DTFT_HEIGHT=240 -DTFT_MOSI=23 -DTFT_SCLK=18 -DTFT_CS=15 -DTFT_DC=2 -DTFT_RST=4 -DLOAD_GLCD -DLOAD_FONT2 -DLOAD_FONT4 -DSPI_FREQUENCY=40000000" \
+            ESP32_RoundDash_Companion
+      - name: Merge complete RoundDash V6 image
+        shell: bash
+        run: |
+          python3 -m esptool --chip esp32 merge_bin -o RoundDash_V6_FULL_MERGED.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000 build_full/ESP32_RoundDash_Companion.ino.bootloader.bin \
+            0x8000 build_full/ESP32_RoundDash_Companion.ino.partitions.bin \
+            0xe000 ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/boot_app0.bin \
+            0x10000 build_full/ESP32_RoundDash_Companion.ino.bin
+          python3 - <<'PY'
+          from pathlib import Path
+          image=Path('RoundDash_V6_FULL_MERGED.bin').read_bytes()
+          assert len(image) > 0x11000 and image[0x1000] == 0xe9 and image[0x10000] == 0xe9
+          print('Full image validated:',len(image),'bytes')
+          PY
+      - name: Compile isolated Wi-Fi diagnostic firmware
+        shell: bash
+        run: |
+          arduino-cli compile -b esp32:esp32:esp32 --output-dir build_wifi \
+            --build-property "compiler.cpp.extra_flags=-DUSER_SETUP_LOADED -DGC9A01_DRIVER -DTFT_WIDTH=240 -DTFT_HEIGHT=240 -DTFT_MOSI=23 -DTFT_SCLK=18 -DTFT_CS=15 -DTFT_DC=2 -DTFT_RST=4 -DLOAD_GLCD -DLOAD_FONT2 -DSPI_FREQUENCY=40000000" \
+            RoundDash_WiFi_Radio_Test
+          python3 -m esptool --chip esp32 merge_bin -o RoundDash_WIFI_RADIO_TEST_0x0.bin \
+            --flash_mode dio --flash_freq 40m --flash_size 4MB \
+            0x1000 build_wifi/RoundDash_WiFi_Radio_Test.ino.bootloader.bin \
+            0x8000 build_wifi/RoundDash_WiFi_Radio_Test.ino.partitions.bin \
+            0xe000 ~/.arduino15/packages/esp32/hardware/esp32/2.0.17/tools/partitions/boot_app0.bin \
+            0x10000 build_wifi/RoundDash_WiFi_Radio_Test.ino.bin
+          python3 - <<'PY'
+          from pathlib import Path
+          img=Path('RoundDash_WIFI_RADIO_TEST_0x0.bin').read_bytes()
+          assert len(img)>0x10000 and img[0x1000]==0xe9 and img[0x10000]==0xe9
+          print('Verified diagnostic merged image size:',len(img))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RoundDash_WIFI_RADIO_TEST_0x0
+          path: RoundDash_WIFI_RADIO_TEST_0x0.bin
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RoundDash_V6_FULL_MERGED
+          path: RoundDash_V6_FULL_MERGED.bin
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: RoundDash_GC9A01_DEMO_MERGED
+          path: RoundDash_GC9A01_DEMO_MERGED.bin
+          if-no-files-found: error
