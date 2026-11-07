@@ -121,7 +121,7 @@ struct GaugeConfig {
   String vehicleName = "2018 Subaru WRX STI";
   String romId = "ZE5T201V_DM23100";
   String ecuId = "A62A907107";
-  String obdName = "OBDII";
+  String obdName = "OBDLink LX";
   String obdPin = "1234";
 } cfg;
 
@@ -139,6 +139,11 @@ struct Reading {
   bool valid = false;
 };
 Reading engineRpm, coolantC, moduleV, mapKpa, baroKpa, boostPsi;
+Reading ssmAfr, ssmAfCorrection, ssmAfLearning, ssmIam, ssmFlkc,
+        ssmWgdc, ssmTiming, ssmThrottle, ssmIat, ssmMafVolt, ssmAccel;
+bool ssmLive = false, ssmSuppressed = false;
+uint8_t ssmProbeFailures=0, ssmConsecutiveMisses=0;
+uint32_t ssmGoodReads=0, ssmBadReads=0;
 bool boostEstimated = true;
 bool turboArmed = true;
 uint32_t turboTriggeredAt = 0;
@@ -222,7 +227,7 @@ void updateButton(uint32_t now) {
 // ------------------------- BLUETOOTH -----------------------------
 // connect(name) can take many seconds to discover an adapter. Performing
 // it in a FreeRTOS worker keeps loop() and the display responsive.
-enum class LinkState : uint8_t { RETRY_WAIT, CONNECTING, INITIALIZING, POLLING, BT_FAILURE };
+enum class LinkState : uint8_t { RETRY_WAIT, CONNECTING, INITIALIZING, POLLING, SSM_POLLING, BT_FAILURE };
 LinkState linkState = LinkState::RETRY_WAIT;
 volatile bool connectFinished = false;
 volatile bool connectSucceeded = false;
@@ -242,6 +247,53 @@ static const char *const INIT_COMMANDS[] = {
   "01 00"     // supported-PID probe
 };
 constexpr uint8_t INIT_COUNT = sizeof(INIT_COMMANDS) / sizeof(INIT_COMMANDS[0]);
+// The V147 Vgelds Gauges APK uses these ELM CAN settings for Subaru SSM.
+// CAN request 0x7E0 -> ECU response 0x7E8; ISO-TP framing by STN/ELM.
+static const char *const SSM_INIT_COMMANDS[] = {
+  "AT Z", "AT E0", "AT L0", "AT S0", "AT H0", "AT SP 6",
+  "AT SH 7E0", "AT CAF1", "AT CFC1", "AT AT1",
+  "A800000008" // Read one coolant byte at SSM address 0x000008
+};
+constexpr uint8_t SSM_INIT_COUNT = sizeof(SSM_INIT_COMMANDS)/sizeof(SSM_INIT_COMMANDS[0]);
+static const char *const ssmInitCommandAt(uint8_t index) {
+  return (cfg.vehiclePreset=="sti_dm"&&!ssmSuppressed) ?
+    SSM_INIT_COMMANDS[index] : INIT_COMMANDS[index];
+}
+static uint8_t ssmInitCommandCount() {
+  return (cfg.vehiclePreset=="sti_dm"&&!ssmSuppressed) ? SSM_INIT_COUNT : INIT_COUNT;
+}
+static const struct SsmParameter {
+  const char *key;
+  uint32_t address;
+  uint8_t size;
+  float scale;
+  float offset;
+  Reading *reading;
+} ssmParameters[] = {
+  // Verified definitions FROM user's V147 logger_catalog_v6.tsv (unit normalization in comments).
+  {"rpm",       0x00000E, 2, 0.25f,              0.0f,   &engineRpm},
+  {"map",       0x00000D, 1, 37.0f/255*6.894757f,0.0f,   &mapKpa}, // absolute kPa
+  {"coolant",   0x000008, 1, 1.0f,              -40.0f,   &coolantC},
+  {"baro",      0x000023, 1, 37.0f/255*6.894757f,0.0f,   &baroKpa},
+  {"voltage",   0x00001C, 1, 0.08f,               0.0f,   &moduleV},
+  {"afr",       0x000046, 1, 14.7f/128.0f,      0.0f,   &ssmAfr},
+  {"afCorr",    0x000009, 1, 100.0f/128.0f,  -100.0f,   &ssmAfCorrection},
+  {"afLearn",   0x00000A, 1, 100.0f/128.0f,  -100.0f,   &ssmAfLearning},
+  {"iam",       0x0000F9, 1, 1.0f/16.0f,         0.0f,   &ssmIam},
+  {"flkc",      0x000199, 1, 0.25f,            -32.0f,   &ssmFlkc},
+  {"wgdc",      0x000030, 1, 100.0f/255.0f,     0.0f,   &ssmWgdc},
+  {"timing",    0x000011, 1, 0.5f,             -64.0f,   &ssmTiming},
+  {"intake",    0x000012, 1, 1.0f,             -40.0f,   &ssmIat},
+  {"throttle",  0x000015, 1, 100.0f/255.0f,     0.0f,   &ssmThrottle},
+  {"mafV",      0x00001D, 1, 0.02f,              0.0f,   &ssmMafVolt},
+  {"accel",     0x000029, 1, 100.0f/255.0f,     0.0f,   &ssmAccel}
+};
+constexpr uint8_t SSM_PARAM_COUNT = sizeof(ssmParameters)/sizeof(ssmParameters[0]);
+static uint8_t ssmIndex=0;
+static const uint8_t SSM_SCHEDULE[] = {0,1,2,0,3,4,0,1,5,6,7,0,8,9,0,1,10,11,12,0,13,14,15};
+constexpr uint8_t SSM_SCHEDULE_COUNT=sizeof(SSM_SCHEDULE)/sizeof(SSM_SCHEDULE[0]);
+static uint8_t ssmScheduleAt=0;
+
 
 // RPM twice per cycle, so tach responsiveness is not sacrificed for boost.
 static const char *const PID_COMMANDS[] = {"01 0C", "01 0B", "01 05", "01 0C", "01 33", "01 42"};
@@ -272,6 +324,11 @@ void scheduleReconnect(uint32_t now) {
   // Invalidate readings immediately so a disconnected ECU is not shown as live.
   engineRpm.valid = coolantC.valid = moduleV.valid = mapKpa.valid = baroKpa.valid = boostPsi.valid = false;
   turboArmed = true; turboTriggeredAt = 0;
+  ssmLive = false;
+  ssmProbeFailures=0;
+  ssmConsecutiveMisses=0;
+  ssmScheduleAt=0;
+  for(uint8_t i=0;i<SSM_PARAM_COUNT;i++) ssmParameters[i].reading->valid=false;
 }
 
 void startConnection(uint32_t now) {
@@ -391,6 +448,73 @@ void processPid(uint8_t which, const char *response, uint32_t now) {
   }
 }
 
+
+// ---------- Subaru SSM read-only decoder; no ECU write/flash commands. --------
+// ELM headers OFF: response "E8 7D" (A8, 1 byte) or "E0 03 E8" (A0, 2 byte).
+// A0 is a 6-byte block-read request for contiguous multi-byte values.
+// Parse on ONE physical reply line to reject stale echoes or partial answers.
+static bool parseSsmReply(const char *response, uint8_t count, uint8_t *value) {
+  const char expectedAck = count==1 ? '8' : '0';
+  while(*response) {
+    char hex[196]; size_t len=0;
+    while(*response&&*response!='\r'&&*response!='\n') {
+      int v=hexDigit(*response);
+      if(v>=0&&len<sizeof(hex)-1)hex[len++]=(char)toupper((unsigned char)*response);
+      ++response;
+    }
+    while(*response=='\r'||*response=='\n')++response;
+    hex[len]=0;
+    // H1 response may prefix 7E8 (three hex digits). Skip only that known ID.
+    size_t start=(len>=3&&memcmp(hex,"7E8",3)==0)?3:0;
+    // H0 is always requested; do not mistake SSM request echo as ECU data.
+    if(len < start+2+count*2 || hex[start]!='E'||hex[start+1]!=expectedAck)
+      continue;
+    for(uint8_t i=0;i<count;i++){
+      int a=hexDigit(hex[start+2+i*2]), b=hexDigit(hex[start+3+i*2]);
+      if(a<0||b<0)return false;
+      value[i]=(uint8_t)((a<<4)|b);
+    }
+    return true;
+  }
+  return false;
+}
+static void ssmCommandFor(const SsmParameter &p,char *dest,size_t maxlen){
+  // A8: read one address; A0: read contiguous 2 bytes (RPM).
+  snprintf(dest,maxlen,p.size==1?"A800%06lX":"A000%06lX%02X",
+           (unsigned long)p.address,(unsigned)(p.size-1));
+}
+static void processSsmPoll(const char *reply,uint32_t now,bool timedOut){
+  const SsmParameter &p=ssmParameters[ssmIndex];
+  uint8_t bytes[4]={};
+  if(timedOut||!parseSsmReply(reply,p.size,bytes)){
+    ssmBadReads++;
+    if(++ssmConsecutiveMisses>=SSM_SCHEDULE_COUNT) {
+      // The ECU/adapter did not answer an entire profile cycle.
+      // Explicit, visible fallback rather than fictitious "SSM Connected".
+      ssmSuppressed=true;
+      ssmLive=false;
+      initIndex=0;initFailures=0;
+      exchange.waiting=false;
+      linkState=LinkState::INITIALIZING;
+      nextSendAt=now+200;
+      Serial.println("[SSM] No replies for full cycle; falling back to Mode 01.");
+      return;
+    }
+  } else {
+    uint32_t raw=0;
+    for(uint8_t i=0;i<p.size;i++)raw=(raw<<8)|bytes[i];
+    p.reading->value = raw*p.scale + p.offset;
+    p.reading->updatedAt = now;
+    p.reading->valid = true;
+    ssmGoodReads++;
+    ssmConsecutiveMisses=0;
+    ssmLive=true;
+    if(p.reading==&mapKpa||p.reading==&baroKpa)refreshBoost(now);
+  }
+  ssmScheduleAt=(ssmScheduleAt+1)%SSM_SCHEDULE_COUNT;
+  ssmIndex=SSM_SCHEDULE[ssmScheduleAt];
+}
+
 void handleElmReply(uint32_t now, bool timedOut) {
   exchange.waiting = false;
   exchange.response[exchange.used] = '\0';
@@ -399,27 +523,45 @@ void handleElmReply(uint32_t now, bool timedOut) {
 #endif
 
   if (linkState == LinkState::INITIALIZING) {
-    const bool isReset = (initIndex == 0);
-    const bool isProbe = (initIndex == INIT_COUNT - 1);
-    const bool badReply = timedOut || strstr(exchange.response, "?") != nullptr ||
-                          strstr(exchange.response, "ERROR") != nullptr;
-    // The ELM reset sometimes omits a prompt. A nonresponding vehicle can
-    // make 0100 time out: continue polling so it recovers when IGN is on.
-    if (badReply && !isReset && !isProbe) {
-      if (++initFailures < 2) {
-        nextSendAt = now + 250;
-        return;
+    const bool isSsmProbe = cfg.vehiclePreset=="sti_dm"&&!ssmSuppressed;
+    const bool isReset = initIndex==0;
+    const bool isProbe = initIndex == ssmInitCommandCount()-1;
+    const bool badReply = timedOut || strstr(exchange.response,"?")!=nullptr ||
+                         strstr(exchange.response,"ERROR")!=nullptr;
+    if(isProbe && isSsmProbe) {
+      uint8_t sample[4]={};
+      if(!badReply && parseSsmReply(exchange.response,1,sample)) {
+        coolantC.value=(float)sample[0]-40.0f;
+        coolantC.updatedAt=now;coolantC.valid=true;
+        ssmLive=true; ssmConsecutiveMisses=0;
+        ssmIndex=0;ssmScheduleAt=0;ssmGoodReads++;
+        linkState=LinkState::SSM_POLLING;
+        Serial.println("[SSM] Subaru A8 read confirmed; SSM/CAN live.");
+        nextSendAt=now+100;return;
       }
-      scheduleReconnect(now);
-      return;
+      if(++ssmProbeFailures<2){nextSendAt=now+250;return;}
+      ssmSuppressed=true;ssmLive=false;initFailures=0;initIndex=0;
+      Serial.println("[SSM] Probe did not confirm SSM; Mode 01 fallback.");
+      nextSendAt=now+120;return;
     }
-    initFailures = 0;
+    if (badReply && !isReset && !isProbe) {
+      if (++initFailures < 2) {nextSendAt = now+250;return;}
+      // A vehicle with missing extended support may still expose standard PIDs.
+      if (isSsmProbe) {
+        ssmSuppressed=true;initIndex=0;initFailures=0;
+        nextSendAt=now+150;return;
+      }
+      scheduleReconnect(now);return;
+    }
+    initFailures=0;
     ++initIndex;
-    if (initIndex >= INIT_COUNT) {
-      pollIndex = 0;
-      linkState = LinkState::POLLING;
+    if(initIndex>=ssmInitCommandCount()) {
+      pollIndex=0;linkState=LinkState::POLLING;
     }
-    nextSendAt = now + (isReset ? 350 : 70);
+    nextSendAt=now+(isReset?350:70);
+  } else if(linkState==LinkState::SSM_POLLING) {
+    processSsmPoll(exchange.response,now,timedOut);
+    nextSendAt=exchange.sentAt+PID_SPACING_MS;
   } else if (linkState == LinkState::POLLING) {
     processPid(pollIndex, exchange.response, now);
     pollIndex = (pollIndex + 1) % PID_COUNT;
@@ -477,8 +619,12 @@ void updateObd(uint32_t now) {
 
   if ((int32_t)(now - nextSendAt) < 0) return;
   if (linkState == LinkState::INITIALIZING)
-    sendElmCommand(INIT_COMMANDS[initIndex], now, true);
-  else if (linkState == LinkState::POLLING)
+    sendElmCommand(ssmInitCommandAt(initIndex), now, true);
+  else if (linkState == LinkState::SSM_POLLING) {
+    char cmd[24];
+    ssmCommandFor(ssmParameters[ssmIndex],cmd,sizeof(cmd));
+    sendElmCommand(cmd,now,false);
+  } else if (linkState == LinkState::POLLING)
     sendElmCommand(PID_COMMANDS[pollIndex], now, false);
 }
 
@@ -829,12 +975,13 @@ static void drawFooter() {
     case LinkState::RETRY_WAIT: message="BT RETRY";break;
     case LinkState::CONNECTING: message="BT CONNECTING";break;
     case LinkState::INITIALIZING: message="ELM SETUP";break;
-    case LinkState::POLLING: message="OBD CONNECTED";break;
+    case LinkState::POLLING: message=ssmSuppressed?"OBD2 FALLBACK":"OBD CONNECTED";break;
+    case LinkState::SSM_POLLING: message="SUBARU SSM LIVE";break;
     case LinkState::BT_FAILURE: message="BT INIT ERROR";break;
   }
   if (radioMode == MODE_BLUETOOTH_OBD) {
     centerFit(String("DRIVE: ") + message, 211, 1,
-              linkState==LinkState::POLLING ? C_GREEN : C_ORANGE, 200);
+              (linkState==LinkState::POLLING||linkState==LinkState::SSM_POLLING) ? C_GREEN : C_ORANGE, 200);
   } else if (!wifiApReady) {
     centerFit("WIFI AP FAILED", 211, 1, C_RED, 160);
   } else if (WiFi.softAPgetStationNum() > 0) {
@@ -1006,8 +1153,16 @@ void sendJson(int status, const String &body) {
 
 String statusJson() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"16.0-usb-editor\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
-  out += linkState == LinkState::POLLING && bt.connected(0) ? "true" : "false";
+  String out = "{\"ok\":true,\"fw\":\"17.0-subaru-ssm\",\"protocol\":";
+  out += ssmLive ? "\"Subaru_SSM_CAN_A8\"" : "\"OBD2_Mode01\"";
+  out += ",\"ssmStreaming\":";
+  out += ssmLive ? "true" : "false";
+  out += ",\"ssmFallback\":";
+  out += ssmSuppressed ? "true" : "false";
+  out += ",\"ssmGoodReads\":" + String(ssmGoodReads);
+  out += ",\"ssmBadReads\":" + String(ssmBadReads);
+  out += ",\"bt\":";
+  out += (linkState==LinkState::POLLING||linkState==LinkState::SSM_POLLING) && bt.connected(0) ? "true" : "false";
   out += ",\"page\":" + String(currentPage);
   out += ",\"wifiApReady\":" + String(wifiApReady ? "true" : "false");
   out += ",\"wifiChannel\":1";
@@ -1034,6 +1189,16 @@ String statusJson() {
   out += fresh(mapKpa, now) ? String(mapKpa.value, 0) : "null";
   out += ",\"baroKpa\":";
   out += fresh(baroKpa, now) ? String(baroKpa.value, 0) : "null";
+  const struct {const char *key;Reading *r;} extras[] = {
+    {"afr",&ssmAfr},{"afCorr",&ssmAfCorrection},{"afLearn",&ssmAfLearning},
+    {"iam",&ssmIam},{"flkc",&ssmFlkc},{"wgdc",&ssmWgdc},
+    {"timing",&ssmTiming},{"throttle",&ssmThrottle},{"intake",&ssmIat},
+    {"mafV",&ssmMafVolt},{"accel",&ssmAccel}
+  };
+  for(const auto &p:extras) {
+    out += ",\"" + String(p.key) + "\":";
+    out += fresh(*p.r,now)?String(p.r->value,2):"null";
+  }
   out += "}";
   return out;
 }
@@ -1348,6 +1513,7 @@ static void serviceUsbEditor(){
 // -------------------------- ARDUINO ------------------------------
 void setup() {
   Serial.begin(115200);
+  Serial.println("[SSM] Read-only Subaru SSM/CAN support, no ECU writes.");
   startedAt = millis();
   lastResetReason = esp_reset_reason();
   if (rebootMagic != BOOT_MAGIC) { rebootMagic = BOOT_MAGIC; rebootCount = 0; }
