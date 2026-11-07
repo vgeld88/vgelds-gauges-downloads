@@ -1006,7 +1006,7 @@ void sendJson(int status, const String &body) {
 
 void handleStatus() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"6.2-wifi\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
+  String out = "{\"ok\":true,\"fw\":\"12.0-dual-radio\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
   out += linkState == LinkState::POLLING && bt.connected(0) ? "true" : "false";
   out += ",\"page\":" + String(currentPage);
   out += ",\"wifiApReady\":" + String(wifiApReady ? "true" : "false");
@@ -1254,6 +1254,20 @@ void setup() {
   Serial.printf("[BOOT] count=%lu reset=%d heap=%u\n", (unsigned long)rebootCount,
                 (int)lastResetReason, ESP.getFreeHeap());
   loadConfig();
+  // Automatic crash recovery: if enabling BT led to watchdog, panic, or
+  // brownout, return to Wi-Fi-safe mode rather than rebooting endlessly.
+  if (radioMode == MODE_BLUETOOTH_OBD &&
+      (lastResetReason == ESP_RST_PANIC || lastResetReason == ESP_RST_INT_WDT ||
+       lastResetReason == ESP_RST_TASK_WDT || lastResetReason == ESP_RST_WDT ||
+       lastResetReason == ESP_RST_BROWNOUT)) {
+    Serial.println("[RECOVERY] Previous DRIVE boot crashed/browned-out. Restoring WIFI-only setup.");
+    radioMode = MODE_WIFI_EDITOR;
+    Preferences recoveryPref;
+    if (recoveryPref.begin("rounddash", false)) {
+      recoveryPref.putUChar("radiomode", MODE_WIFI_EDITOR);
+      recoveryPref.end();
+    }
+  }
   // Migrate V1 numeric-only positions to the V2 analog dial layout.
   if(cfg.valueY<152 || cfg.titleY<63 || cfg.unitY<178){
     cfg.titleY=75; cfg.valueY=166; cfg.unitY=188;
