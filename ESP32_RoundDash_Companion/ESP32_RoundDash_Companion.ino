@@ -11,9 +11,9 @@
 
   TFT_eSPI's User_Setup must define:
      GC9A01_DRIVER, TFT_WIDTH 240, TFT_HEIGHT 240
-     TFT_MOSI 23, TFT_SCLK 18, TFT_CS 15, TFT_DC 2, TFT_RST 4
+     TFT_MOSI 23, TFT_SCLK 18, TFT_CS -1, TFT_DC 2, TFT_RST -1
      SPI_FREQUENCY 40000000
-  TFT_eSPI owns the display pins; no pinMode() for them here.
+  One SPI bus, manual CS pins 15/16/17, shared hardware reset on GPIO4.
 
   Display RAM (front buffer) + one full TFT_eSprite (back buffer)
   provide double-buffered, tear-minimized rendering. An 8-bit sprite
@@ -27,6 +27,7 @@
 #include <WebServer.h>
 #include <Preferences.h>
 #include <TFT_eSPI.h>
+#include "RoundDashTypes.h"
 #include <math.h>
 #include <ctype.h>
 #include <string.h>
@@ -168,6 +169,14 @@ struct Reading {
 Reading engineRpm, coolantC, moduleV, mapKpa, baroKpa, boostPsi;
 Reading ssmAfr, ssmAfCorrection, ssmAfLearning, ssmIam, ssmFlkc,
         ssmWgdc, ssmTiming, ssmThrottle, ssmIat, ssmMafVolt, ssmAccel;
+
+static Reading* tripleReading(uint8_t i){
+  Reading* a[]={&boostPsi,&coolantC,&moduleV,&engineRpm,&ssmIam,&ssmAfr,
+    &ssmWgdc,&ssmFlkc,&ssmTiming,&ssmThrottle,&ssmIat,&ssmAfLearning,
+    &ssmAfCorrection,&mapKpa,&baroKpa,&ssmMafVolt};
+  return i<TRIPLE_SENSOR_COUNT?a[i]:nullptr;
+}
+
 bool ssmLive = false, ssmSuppressed = false;
 uint8_t ssmProbeFailures=0, ssmConsecutiveMisses=0;
 uint32_t ssmGoodReads=0, ssmBadReads=0;
@@ -189,12 +198,6 @@ static const char* tripleUnit(uint8_t i){
   const char* const a[]={"PSI","C","V","RPM","IAM","AFR","%","DEG",
     "DEG","%","C","%","%","KPA","KPA","V"};
   return i<TRIPLE_SENSOR_COUNT?a[i]:"";
-}
-static Reading* tripleReading(uint8_t i){
-  Reading* a[]={&boostPsi,&coolantC,&moduleV,&engineRpm,&ssmIam,&ssmAfr,
-    &ssmWgdc,&ssmFlkc,&ssmTiming,&ssmThrottle,&ssmIat,&ssmAfLearning,
-    &ssmAfCorrection,&mapKpa,&baroKpa,&ssmMafVolt};
-  return i<TRIPLE_SENSOR_COUNT?a[i]:nullptr;
 }
 static void tripleRange(uint8_t i,float &lo,float &hi){
   const float a[]={-15,40,10,0,0,7,0,-8,-20,0,-30,-30,-30,0,70,0};
