@@ -478,7 +478,8 @@ static bool parseSsmReply(const char *response, uint8_t count, uint8_t *value) {
   }
   return false;
 }
-static void ssmCommandFor(const SsmParameter &p,char *dest,size_t maxlen){
+static void ssmCommandFor(uint8_t parameterIndex,char *dest,size_t maxlen){
+  const SsmParameter &p=ssmParameters[parameterIndex];
   // A8: read one address; A0: read contiguous 2 bytes (RPM).
   snprintf(dest,maxlen,p.size==1?"A800%06lX":"A000%06lX%02X",
            (unsigned long)p.address,(unsigned)(p.size-1));
@@ -622,7 +623,7 @@ void updateObd(uint32_t now) {
     sendElmCommand(ssmInitCommandAt(initIndex), now, true);
   else if (linkState == LinkState::SSM_POLLING) {
     char cmd[24];
-    ssmCommandFor(ssmParameters[ssmIndex],cmd,sizeof(cmd));
+    ssmCommandFor(ssmIndex,cmd,sizeof(cmd));
     sendElmCommand(cmd,now,false);
   } else if (linkState == LinkState::POLLING)
     sendElmCommand(PID_COMMANDS[pollIndex], now, false);
