@@ -293,6 +293,20 @@ static uint8_t ssmIndex=0;
 static const uint8_t SSM_SCHEDULE[] = {0,1,2,0,3,4,0,1,5,6,7,0,8,9,0,1,10,11,12,0,13,14,15};
 constexpr uint8_t SSM_SCHEDULE_COUNT=sizeof(SSM_SCHEDULE)/sizeof(SSM_SCHEDULE[0]);
 static uint8_t ssmScheduleAt=0;
+// V21 uses STPX batched read transactions just like the working Vgelds Gauges
+// Bluetooth SSM client. No ECU writes, no flashing, no ROM modification.
+// Return payloads max six bytes so the ECU response stays one CAN frame.
+static const uint8_t batchLen[3]={6,6,5};
+static const uint8_t batchParam[3][6]={
+  {0,0,1,3,5,10}, {2,4,12,13,6,7}, {8,9,11,14,15,0}
+};
+static const uint8_t batchOffset[3][6]={
+  {0,1,0,0,0,0}, {0,0,0,0,0,0}, {0,0,0,0,0,0}
+};
+static bool batchOn=false, batchFallback=false;
+static uint8_t batchGroup=0, batchFails=0;
+static uint32_t rejectedSsm=0;
+static const char *lastRejectedSsm="";
 
 
 // RPM twice per cycle, so tach responsiveness is not sacrificed for boost.
@@ -328,6 +342,7 @@ void scheduleReconnect(uint32_t now) {
   ssmProbeFailures=0;
   ssmConsecutiveMisses=0;
   ssmScheduleAt=0;
+  batchOn=false;batchFallback=false;batchGroup=0;batchFails=0;
   for(uint8_t i=0;i<SSM_PARAM_COUNT;i++) ssmParameters[i].reading->valid=false;
 }
 
@@ -453,8 +468,9 @@ void processPid(uint8_t which, const char *response, uint32_t now) {
 // ELM headers OFF: response "E8 7D" (A8, 1 byte) or "E0 03 E8" (A0, 2 byte).
 // A0 is a 6-byte block-read request for contiguous multi-byte values.
 // Parse on ONE physical reply line to reject stale echoes or partial answers.
-static bool parseSsmReply(const char *response, uint8_t count, uint8_t *value) {
-  const char expectedAck = count==1 ? '8' : '0';
+static bool parseSsmReply(const char *response, uint8_t count,
+                          uint8_t *value, bool addressRead) {
+  const char expectedAck = addressRead ? '8' : '0';
   while(*response) {
     char hex[196]; size_t len=0;
     while(*response&&*response!='\r'&&*response!='\n') {
@@ -484,10 +500,73 @@ static void ssmCommandFor(uint8_t parameterIndex,char *dest,size_t maxlen){
   snprintf(dest,maxlen,p.size==1?"A800%06lX":"A000%06lX%02X",
            (unsigned long)p.address,(unsigned)(p.size-1));
 }
+
+static bool decodeValidatedSsm(uint8_t index,uint32_t raw,uint32_t now) {
+  // Same address/scaling as the user's V147 APK; disallow obviously corrupt
+  // values instead of showing ECU raw frames as a real measurement.
+  const float low[SSM_PARAM_COUNT]={
+    0,15,-40,65,7,7,-50,-50,0,-16,0,-50,-40,0,0,0
+  };
+  const float high[SSM_PARAM_COUNT]={
+    10500,300,140,120,19,25,50,50,1.05f,16,100,75,120,100,5.2f,100
+  };
+  const SsmParameter &p=ssmParameters[index];
+  const float value=(float)raw*p.scale+p.offset;
+  if(!isfinite(value)||value<low[index]||value>high[index]) {
+    rejectedSsm++;
+    lastRejectedSsm=p.key;
+    p.reading->valid=false;
+    return false;
+  }
+  p.reading->value=value;
+  p.reading->updatedAt=now;
+  p.reading->valid=true;
+  ssmGoodReads++;
+  if(p.reading==&mapKpa||p.reading==&baroKpa)refreshBoost(now);
+  return true;
+}
+static void makeSsmBatchCommand(uint8_t group,char *dest,size_t maxLen) {
+  snprintf(dest,maxLen,"STPX h:7E0,d:A800");
+  size_t at=strlen(dest);
+  for(uint8_t i=0;i<batchLen[group] && at+7<maxLen;i++) {
+    const uint8_t p=batchParam[group][i];
+    const uint32_t addr=ssmParameters[p].address+batchOffset[group][i];
+    int written=snprintf(dest+at,maxLen-at,"%06lX",(unsigned long)addr);
+    if(written<0)break;
+    at+=(size_t)written;
+  }
+}
+static void processSsmBatch(const char *response,uint32_t now,bool timeout) {
+  const uint8_t group=batchGroup;
+  uint8_t bytes[6]={0};
+  if(timeout||!parseSsmReply(response,batchLen[group],bytes,true)) {
+    ssmBadReads++;
+    if(++batchFails>=2) {
+      // Some adapters reject multi-frame STPX writes. Do not break the
+      // already-working SSM connection; revert to the old A8/A0 reader.
+      batchOn=false;batchFallback=true;batchFails=0;
+      ssmIndex=0;ssmScheduleAt=0;ssmConsecutiveMisses=0;
+      Serial.println("[SSM] STPX batch unavailable; using individual reads.");
+    }
+    return;
+  }
+  uint32_t raw[SSM_PARAM_COUNT]={0};
+  bool seen[SSM_PARAM_COUNT]={false};
+  for(uint8_t k=0;k<batchLen[group];k++) {
+    uint8_t i=batchParam[group][k];
+    raw[i]=(raw[i]<<8)|bytes[k];
+    seen[i]=true;
+  }
+  for(uint8_t i=0;i<SSM_PARAM_COUNT;i++)if(seen[i])decodeValidatedSsm(i,raw[i],now);
+  ssmLive=true;ssmConsecutiveMisses=0;batchFails=0;
+  batchGroup=(batchGroup+1)%3;
+}
+
 static void processSsmPoll(const char *reply,uint32_t now,bool timedOut){
+  if(batchOn){processSsmBatch(reply,now,timedOut);return;}
   const SsmParameter &p=ssmParameters[ssmIndex];
   uint8_t bytes[4]={};
-  if(timedOut||!parseSsmReply(reply,p.size,bytes)){
+  if(timedOut||!parseSsmReply(reply,p.size,bytes,p.size==1)){
     ssmBadReads++;
     if(++ssmConsecutiveMisses>=SSM_SCHEDULE_COUNT) {
       // The ECU/adapter did not answer an entire profile cycle.
@@ -504,13 +583,10 @@ static void processSsmPoll(const char *reply,uint32_t now,bool timedOut){
   } else {
     uint32_t raw=0;
     for(uint8_t i=0;i<p.size;i++)raw=(raw<<8)|bytes[i];
-    p.reading->value = raw*p.scale + p.offset;
-    p.reading->updatedAt = now;
-    p.reading->valid = true;
-    ssmGoodReads++;
-    ssmConsecutiveMisses=0;
-    ssmLive=true;
-    if(p.reading==&mapKpa||p.reading==&baroKpa)refreshBoost(now);
+    if(decodeValidatedSsm(ssmIndex,raw,now)){
+      ssmConsecutiveMisses=0;
+      ssmLive=true;
+    }
   }
   ssmScheduleAt=(ssmScheduleAt+1)%SSM_SCHEDULE_COUNT;
   ssmIndex=SSM_SCHEDULE[ssmScheduleAt];
@@ -531,11 +607,13 @@ void handleElmReply(uint32_t now, bool timedOut) {
                          strstr(exchange.response,"ERROR")!=nullptr;
     if(isProbe && isSsmProbe) {
       uint8_t sample[4]={};
-      if(!badReply && parseSsmReply(exchange.response,1,sample)) {
+      if(!badReply && parseSsmReply(exchange.response,1,sample,true)) {
         coolantC.value=(float)sample[0]-40.0f;
         coolantC.updatedAt=now;coolantC.valid=true;
         ssmLive=true; ssmConsecutiveMisses=0;
         ssmIndex=0;ssmScheduleAt=0;ssmGoodReads++;
+        batchOn=cfg.obdName.indexOf("OBDLink")>=0;
+        batchFallback=false;batchFails=0;batchGroup=0;
         linkState=LinkState::SSM_POLLING;
         Serial.println("[SSM] Subaru A8 read confirmed; SSM/CAN live.");
         nextSendAt=now+100;return;
@@ -622,8 +700,9 @@ void updateObd(uint32_t now) {
   if (linkState == LinkState::INITIALIZING)
     sendElmCommand(ssmInitCommandAt(initIndex), now, true);
   else if (linkState == LinkState::SSM_POLLING) {
-    char cmd[24];
-    ssmCommandFor(ssmIndex,cmd,sizeof(cmd));
+    char cmd[96];
+    if(batchOn)makeSsmBatchCommand(batchGroup,cmd,sizeof(cmd));
+    else ssmCommandFor(ssmIndex,cmd,sizeof(cmd));
     sendElmCommand(cmd,now,false);
   } else if (linkState == LinkState::POLLING)
     sendElmCommand(PID_COMMANDS[pollIndex], now, false);
@@ -1219,7 +1298,7 @@ void sendJson(int status, const String &body) {
 
 String statusJson() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"20.0-ghost-sweep-pro\",\"protocol\":";
+  String out = "{\"ok\":true,\"fw\":\"21.0-vgelds-ssm\",\"protocol\":";
   out += ssmLive ? "\"Subaru_SSM_CAN_A8\"" : "\"OBD2_Mode01\"";
   out += ",\"ssmStreaming\":";
   out += ssmLive ? "true" : "false";
@@ -1227,6 +1306,10 @@ String statusJson() {
   out += ssmSuppressed ? "true" : "false";
   out += ",\"ssmGoodReads\":" + String(ssmGoodReads);
   out += ",\"ssmBadReads\":" + String(ssmBadReads);
+  out += ",\"ssmBatch\":" + String(batchOn?"true":"false");
+  out += ",\"ssmBatchFallback\":" + String(batchFallback?"true":"false");
+  out += ",\"ssmRejected\":" + String(rejectedSsm);
+  out += ",\"ssmLastRejected\":" + jsonQuote(String(lastRejectedSsm));
   out += ",\"bt\":";
   out += (linkState==LinkState::POLLING||linkState==LinkState::SSM_POLLING) && bt.connected(0) ? "true" : "false";
   out += ",\"page\":" + String(currentPage);
