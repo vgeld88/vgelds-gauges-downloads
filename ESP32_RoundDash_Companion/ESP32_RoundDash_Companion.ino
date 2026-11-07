@@ -957,11 +957,11 @@ void handleStatus() {
   String out = "{\"ok\":true,\"fw\":\"5.0\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
   out += linkState == LinkState::POLLING && bt.connected(0) ? "true" : "false";
   out += ",\"page\":" + String(currentPage);
-  out += ",\\\"heap\\\":" + String(ESP.getFreeHeap());
-  out += ",\\\"wifiClients\\\":" + String(WiFi.softAPgetStationNum());
-  out += ",\\\"wifiLeaveReason\\\":" + String((int)lastApLeaveReason);
-  out += ",\\\"wifiJoins\\\":" + String((unsigned long)apJoins);
-  out += ",\\\"wifiLeaves\\\":" + String((unsigned long)apLeaves);
+  out += ",\"heap\":" + String(ESP.getFreeHeap());
+  out += ",\"wifiClients\":" + String(WiFi.softAPgetStationNum());
+  out += ",\"wifiLeaveReason\":" + String((int)lastApLeaveReason);
+  out += ",\"wifiJoins\":" + String((unsigned long)apJoins);
+  out += ",\"wifiLeaves\":" + String((unsigned long)apLeaves);
   out += ",\"rpm\":";
   out += fresh(engineRpm, now) ? String(engineRpm.value, 0) : "null";
   out += ",\"coolant\":";
@@ -1158,11 +1158,11 @@ void handlePage() {
 void onSoftAPEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
     apJoins++;
-    Serial.printf("[WIFI] Samsung/phone associated; total joins=%lu\\n", (unsigned long)apJoins);
+    Serial.printf("[WIFI] Samsung/phone associated; total joins=%lu\n", (unsigned long)apJoins);
   } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
     apLeaves++;
     lastApLeaveReason = info.wifi_ap_stadisconnected.reason;
-    Serial.printf("[WIFI] Client disconnected reason=%u leaves=%lu\\n",
+    Serial.printf("[WIFI] Client disconnected reason=%u leaves=%lu\n",
                   (unsigned)lastApLeaveReason, (unsigned long)apLeaves);
   }
 }
@@ -1173,7 +1173,7 @@ void initHttp() {
   WiFi.onEvent(onSoftAPEvent);
   // Fixed 2.4GHz channel, visible WPA2 network, up to 4 phones.
   bool apOK = WiFi.softAP(AP_SSID, AP_PASSWORD, 6, 0, 4);
-  Serial.printf("[WIFI] AP start=%s ssid=%s channel=6 ip=%s\\n",
+  Serial.printf("[WIFI] AP start=%s ssid=%s channel=6 ip=%s\n",
                 apOK ? "YES" : "NO", AP_SSID, WiFi.softAPIP().toString().c_str());
   if (!apOK) Serial.println("ERROR: Could not start Wi-Fi AP");
   server.on("/api/status", HTTP_GET, handleStatus);
