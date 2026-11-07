@@ -1018,7 +1018,7 @@ void sendJson(int status, const String &body) {
 
 void handleStatus() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"13.0-hotspot\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
+  String out = "{\"ok\":true,\"fw\":\"14.0-usb-hotspot\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
   out += linkState == LinkState::POLLING && bt.connected(0) ? "true" : "false";
   out += ",\"page\":" + String(currentPage);
   out += ",\"wifiApReady\":" + String(wifiApReady ? "true" : "false");
@@ -1375,6 +1375,114 @@ static void serviceHotspot(uint32_t now) {
     Serial.println("[HOTSPOT] Trying stored Samsung hotspot (credentials not logged).");
   }
 }
+// ---------------- USB HOTSPOT PROVISIONING (NO PHONE WI-FI REQUIRED) ---------------
+// Normal firmware USB UART, not ESP32 ROM bootloader. Credentials are hex-encoded
+// on the wire to safely contain punctuation, and are never echoed or logged.
+// Protocol: RDH14SET:<hex-SSID>:<hex-PASSWORD>\n  -> RDH14:OK:SAVED
+//           RDH14PING\n                       -> RDH14:OK:READY
+//           RDH14STATUS\n                     -> RDH14:STATUS:...
+// Configure only on the bench via the user's authorized USB connection.
+static char usbSetupLine[232];
+static size_t usbSetupUsed = 0;
+static uint32_t usbSetupLastByteAt = 0;
+
+static int usbHexDigit(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+  if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+  return -1;
+}
+static bool usbDecodeHex(const String &hex, String &decoded, size_t maxBytes) {
+  if (hex.length() & 1 || hex.length() > 2 * maxBytes) return false;
+  decoded = "";
+  for (size_t i = 0; i < hex.length(); i += 2) {
+    int hi = usbHexDigit(hex[i]), lo = usbHexDigit(hex[i+1]);
+    if (hi < 0 || lo < 0) return false;
+    uint8_t c = (uint8_t)((hi << 4) | lo);
+    if (c == 0 || c == 10 || c == 13) return false; // NUL and newline disallowed
+    decoded += (char)c;
+  }
+  return true;
+}
+static void processUsbSetupLine(const String &line) {
+  if (line == "RDH14PING") {
+    Serial.println("RDH14:OK:READY");
+    return;
+  }
+  if (line == "RDH14STATUS") {
+    if (radioMode != MODE_WIFI_EDITOR) {
+      Serial.println("RDH14:ERROR:SWITCH_TO_WIFI_SETUP");
+      return;
+    }
+    if (hotspotConfigured && WiFi.status() == WL_CONNECTED) {
+      Serial.print("RDH14:STATUS:CONNECTED:");
+      Serial.println(WiFi.localIP().toString());
+    } else if (hotspotConfigured) {
+      Serial.println("RDH14:STATUS:SEARCHING");
+    } else {
+      Serial.println("RDH14:STATUS:NOT_CONFIGURED");
+    }
+    return;
+  }
+  if (!line.startsWith("RDH14SET:")) return; // ignore other serial traffic
+  if (radioMode != MODE_WIFI_EDITOR) {
+    Serial.println("RDH14:ERROR:SWITCH_TO_WIFI_SETUP");
+    return;
+  }
+  int delimiter = line.indexOf(':', 9);
+  if (delimiter < 0) {
+    Serial.println("RDH14:ERROR:FORMAT");
+    return;
+  }
+  String name, secret;
+  if (!usbDecodeHex(line.substring(9, delimiter), name, 32) ||
+      !usbDecodeHex(line.substring(delimiter + 1), secret, 63) ||
+      name.length() < 1 || secret.length() < 8 || secret.length() > 63) {
+    Serial.println("RDH14:ERROR:INVALID_CREDENTIAL_LENGTH_OR_ENCODING");
+    return;
+  }
+  Preferences p;
+  if (!p.begin("rdhotspot", false)) {
+    Serial.println("RDH14:ERROR:STORAGE");
+    return;
+  }
+  bool goodName = p.putString("ssid", name) == name.length();
+  bool goodPass = p.putString("pass", secret) == secret.length();
+  p.end();
+  if (!goodName || !goodPass) {
+    Serial.println("RDH14:ERROR:STORAGE");
+    return;
+  }
+  hotspotName = name;
+  hotspotPassword = secret;
+  hotspotConfigured = true;
+  hotspotWasConnected = false;
+  hotspotProvisionPending = true;
+  hotspotPendingAt = millis();
+  nextHotspotAttemptAt = millis();
+  Serial.println("RDH14:OK:SAVED");
+}
+static void pollUsbSetup() {
+  if (usbSetupUsed && millis() - usbSetupLastByteAt > 2500) usbSetupUsed = 0;
+  uint8_t budget = 100;
+  while (Serial.available() && budget--) {
+    int b = Serial.read();
+    if (b < 0) break;
+    usbSetupLastByteAt = millis();
+    if (b == '\r') continue;
+    if (b == '\n') {
+      usbSetupLine[usbSetupUsed] = 0;
+      if (usbSetupUsed) processUsbSetupLine(String(usbSetupLine));
+      usbSetupUsed = 0;
+    } else if (usbSetupUsed + 1 < sizeof(usbSetupLine)) {
+      usbSetupLine[usbSetupUsed++] = (char)b;
+    } else {
+      usbSetupUsed = 0;
+      Serial.println("RDH14:ERROR:COMMAND_TOO_LONG");
+    }
+  }
+}
+
 // -------------------------- ARDUINO ------------------------------
 void setup() {
   Serial.begin(115200);
@@ -1436,6 +1544,7 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
+  pollUsbSetup();
   if (radioMode == MODE_WIFI_EDITOR) {
     server.handleClient();
     serviceHotspot(now);
