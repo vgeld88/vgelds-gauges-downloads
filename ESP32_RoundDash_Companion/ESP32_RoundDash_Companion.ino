@@ -44,7 +44,7 @@ static const char *AP_PASSWORD = "rounddash826";
 static uint32_t wifiBootAt = 0;
 static bool bluetoothStarted = false;
 static volatile uint32_t apJoins = 0, apLeaves = 0;
-static volatile uint8_t lastApLeaveReason = 0;
+
 constexpr bool USE_BOOT_BUTTON = true;
 constexpr uint32_t DEBOUNCE_MS = 35;
 constexpr uint32_t LONG_PRESS_MS = 700;
@@ -796,8 +796,8 @@ static void drawFooter() {
     centerFit(String("WIFI PHONE ") + WiFi.softAPgetStationNum(),211,1,C_GREEN,130);
   else if (millis() - wifiBootAt < 90000)
     centerFit("WIFI READY - JOIN",211,1,C_GREEN,130);
-  else if (lastApLeaveReason != 0)
-    centerFit(String("WIFI ERR ") + lastApLeaveReason,211,1,C_ORANGE,130);
+  else if (apLeaves != 0)
+    centerFit(String("WIFI LEFT ") + apLeaves,211,1,C_ORANGE,130);
   else
     centerFit("WIFI NO PHONE",211,1,C_GREY,130);
   for(int i=0;i<4;i++)frame.fillCircle(102+12*i,226,2,i==currentPage?cfg.accent565:C_DIM);
@@ -959,7 +959,6 @@ void handleStatus() {
   out += ",\"page\":" + String(currentPage);
   out += ",\"heap\":" + String(ESP.getFreeHeap());
   out += ",\"wifiClients\":" + String(WiFi.softAPgetStationNum());
-  out += ",\"wifiLeaveReason\":" + String((int)lastApLeaveReason);
   out += ",\"wifiJoins\":" + String((unsigned long)apJoins);
   out += ",\"wifiLeaves\":" + String((unsigned long)apLeaves);
   out += ",\"rpm\":";
@@ -1161,9 +1160,7 @@ void onSoftAPEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
     Serial.printf("[WIFI] Samsung/phone associated; total joins=%lu\n", (unsigned long)apJoins);
   } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
     apLeaves++;
-    lastApLeaveReason = info.wifi_ap_stadisconnected.reason;
-    Serial.printf("[WIFI] Client disconnected reason=%u leaves=%lu\n",
-                  (unsigned)lastApLeaveReason, (unsigned long)apLeaves);
+    Serial.printf("[WIFI] Client disconnected, leaves=%lu\n", (unsigned long)apLeaves);
   }
 }
 void initHttp() {
