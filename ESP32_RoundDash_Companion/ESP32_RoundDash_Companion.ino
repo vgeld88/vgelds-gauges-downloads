@@ -39,6 +39,12 @@
 // WPA2 password must contain at least 8 characters. Change for your own unit.
 static const char *AP_SSID = "RoundDash-ESP32";
 static const char *AP_PASSWORD = "rounddash826";
+// 90-second Wi-Fi-first startup avoids competing Bluetooth inquiry radio traffic
+// while a phone is authenticating to the ESP32's access point.
+static uint32_t wifiBootAt = 0;
+static bool bluetoothStarted = false;
+static volatile uint32_t apJoins = 0, apLeaves = 0;
+static volatile uint8_t lastApLeaveReason = 0;
 constexpr bool USE_BOOT_BUTTON = true;
 constexpr uint32_t DEBOUNCE_MS = 35;
 constexpr uint32_t LONG_PRESS_MS = 700;
@@ -784,7 +790,16 @@ static void drawFooter() {
     case LinkState::POLLING: message="OBD CONNECTED";break;
     case LinkState::BT_FAILURE: message="BT INIT ERROR";break;
   }
-  centerFit(message,211,1,linkState==LinkState::POLLING?C_GREEN:C_GREY,130);
+  // Show connection status even with no OBD adapter. This is useful when
+  // diagnosing Samsung Wi-Fi association without a USB serial monitor.
+  if (WiFi.softAPgetStationNum() > 0)
+    centerFit(String("WIFI PHONE ") + WiFi.softAPgetStationNum(),211,1,C_GREEN,130);
+  else if (millis() - wifiBootAt < 90000)
+    centerFit("WIFI READY - JOIN",211,1,C_GREEN,130);
+  else if (lastApLeaveReason != 0)
+    centerFit(String("WIFI ERR ") + lastApLeaveReason,211,1,C_ORANGE,130);
+  else
+    centerFit("WIFI NO PHONE",211,1,C_GREY,130);
   for(int i=0;i<4;i++)frame.fillCircle(102+12*i,226,2,i==currentPage?cfg.accent565:C_DIM);
 }
 
@@ -942,7 +957,11 @@ void handleStatus() {
   String out = "{\"ok\":true,\"fw\":\"5.0\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
   out += linkState == LinkState::POLLING && bt.connected(0) ? "true" : "false";
   out += ",\"page\":" + String(currentPage);
-  out += ",\"heap\":" + String(ESP.getFreeHeap());
+  out += ",\\\"heap\\\":" + String(ESP.getFreeHeap());
+  out += ",\\\"wifiClients\\\":" + String(WiFi.softAPgetStationNum());
+  out += ",\\\"wifiLeaveReason\\\":" + String((int)lastApLeaveReason);
+  out += ",\\\"wifiJoins\\\":" + String((unsigned long)apJoins);
+  out += ",\\\"wifiLeaves\\\":" + String((unsigned long)apLeaves);
   out += ",\"rpm\":";
   out += fresh(engineRpm, now) ? String(engineRpm.value, 0) : "null";
   out += ",\"coolant\":";
@@ -1136,9 +1155,27 @@ void handlePage() {
   } else sendJson(400, "{\"ok\":false,\"message\":\"Page must be 0..3\"}");
 }
 
+void onSoftAPEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
+  if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
+    apJoins++;
+    Serial.printf("[WIFI] Samsung/phone associated; total joins=%lu\\n", (unsigned long)apJoins);
+  } else if (event == ARDUINO_EVENT_WIFI_AP_STADISCONNECTED) {
+    apLeaves++;
+    lastApLeaveReason = info.wifi_ap_stadisconnected.reason;
+    Serial.printf("[WIFI] Client disconnected reason=%u leaves=%lu\\n",
+                  (unsigned)lastApLeaveReason, (unsigned long)apLeaves);
+  }
+}
 void initHttp() {
+  wifiBootAt = millis();
+  WiFi.persistent(false);
   WiFi.mode(WIFI_AP);
-  if (!WiFi.softAP(AP_SSID, AP_PASSWORD)) Serial.println("ERROR: Could not start Wi-Fi AP");
+  WiFi.onEvent(onSoftAPEvent);
+  // Fixed 2.4GHz channel, visible WPA2 network, up to 4 phones.
+  bool apOK = WiFi.softAP(AP_SSID, AP_PASSWORD, 6, 0, 4);
+  Serial.printf("[WIFI] AP start=%s ssid=%s channel=6 ip=%s\\n",
+                apOK ? "YES" : "NO", AP_SSID, WiFi.softAPIP().toString().c_str());
+  if (!apOK) Serial.println("ERROR: Could not start Wi-Fi AP");
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/config", HTTP_GET, handleGetConfig);
   server.on("/api/config", HTTP_POST, [](){handleWriteConfig(true);});
@@ -1168,24 +1205,30 @@ void setup() {
 
   initHttp();
   pageChangedAt = millis();
-  // Master mode is essential; most ELM327 adapters are SPP slaves.
-  bluetoothReady = bt.begin("ESP32-OBD-DASH", true);
-  if (bluetoothReady) {
-    // Only needed for adapters that use a classic legacy PIN.
-    bt.setPin(cfg.obdPin.c_str());
-    linkState = LinkState::RETRY_WAIT;
-    retryAt = millis() - RECONNECT_MS; // try right away
-  } else {
-    linkState = LinkState::BT_FAILURE;
-    Serial.println("ERROR: Bluetooth Classic could not start");
-  }
+  // Bluetooth initialization is deferred until a phone authenticates to Wi-Fi
+  // or the 90-second setup window expires. No functionality is removed.
+  linkState = LinkState::RETRY_WAIT;
+  retryAt = millis();
 }
 
 void loop() {
   uint32_t now = millis();
   server.handleClient();
+  if (!bluetoothStarted && (WiFi.softAPgetStationNum() > 0 || (uint32_t)(now - wifiBootAt) >= 90000)) {
+    bluetoothStarted = true;
+    // Master mode is essential; most ELM327 adapters are SPP slaves.
+    bluetoothReady = bt.begin("ESP32-OBD-DASH", true);
+    if (bluetoothReady) {
+      bt.setPin(cfg.obdPin.c_str());
+      linkState = LinkState::RETRY_WAIT;
+      retryAt = now - RECONNECT_MS;
+    } else {
+      linkState = LinkState::BT_FAILURE;
+      Serial.println("ERROR: Bluetooth Classic could not start");
+    }
+  }
   updateButton(now);
-  updateObd(now);
+  if (bluetoothStarted) updateObd(now);
   renderScreen(now);
   // Intentionally no delay(): polling, UI and input are millis()-driven.
 }
