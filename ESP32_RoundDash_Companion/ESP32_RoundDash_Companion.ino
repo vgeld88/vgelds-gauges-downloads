@@ -838,63 +838,128 @@ static void turbineIcon(int x,int y,int radius,uint32_t now) {
   }
   frame.fillCircle(x,y,5,C_DARK);frame.fillCircle(x,y,2,steel);
 }
-// V5 Ghost Sweep instrument: thin segmented blue/amber/red dial from the
-// screenshot reference, large white digital RPM and compact internal numerals.
-// Uses only integer framebuffer primitives; colour sweep is an ACTUAL layout.
+// V20 GHOST SWEEP PRO — same screen rotation and physical 240px panel.
+// A true full-scale arc (not fabricated live values), a smoothly tracked
+// position marker, fewer labels, and two separately spaced status lines.
+// Keep all critical text away from the 211px radio footer and 226px page dots.
+static float ghostPointerF[4] = {0,0,0,0};
+static bool ghostPointerHasData[4] = {false,false,false,false};
 static void renderGhostSweep(uint32_t now) {
-  Reading *r = currentPage==0?&engineRpm:currentPage==1?&coolantC:currentPage==2?&moduleV:&boostPsi;
-  const bool ok=fresh(*r,now);
-  const float lo=currentPage==0?0:currentPage==1?cfg.coolantMin:currentPage==2?cfg.voltageMin:cfg.boostMin;
-  const float hi=currentPage==0?cfg.rpmMax:currentPage==1?cfg.coolantMax:currentPage==2?cfg.voltageMax:cfg.boostMax;
-  const float fraction=ok?clampFloat((r->value-lo)/max(.1f,hi-lo),0,1):0;
-  const uint16_t ice=0x3E7F;      // bright cyan
-  const uint16_t blue=0x139C;     // electric blue
-  const uint16_t amber=0xFD66;
-  const uint16_t hot=0xE269;
-  // The old bezel (if enabled) is deliberately replaced for a black-faced,
-  // nearly flush instrument with a narrow textured outer surround.
+  const uint8_t page=currentPage;
+  const Reading *r=page==0?&engineRpm:page==1?&coolantC:
+                   page==2?&moduleV:&boostPsi;
+  const bool live=fresh(*r,now);
+  const float lower=page==0?0.0f:page==1?cfg.coolantMin:
+                    page==2?cfg.voltageMin:cfg.boostMin;
+  const float upper=page==0?cfg.rpmMax:page==1?cfg.coolantMax:
+                    page==2?cfg.voltageMax:cfg.boostMax;
+  const uint16_t cyan=0x4E9F, blue=0x139C;
+  const uint16_t amber=0xFD66, red=0xEA4A;
+  const uint16_t steel=0x94B2, soft=0x6B4D;
+  const float arcStart=150.0f, arcSweep=240.0f;
+
+  // Black glass with restrained metallic bezel. Does not depend on a custom
+  // background colour: a saved colour can never hide the ghost layout.
   frame.fillSprite(0x0000);
-  frame.fillCircle(CX,CY,118,0x1884);
-  frame.fillCircle(CX,CY,114,0x0842);
-  frame.fillCircle(CX,CY,109,0x0020);
-  frame.drawCircle(CX,CY,108,C_DIM);
-  // Screen angle uses 0=right, 90=down, 180=left, 270=up;
-  // an arc of 150..390 degrees wraps naturally across the upper dial.
-  const float startDeg=150.0f, sweepDeg=240.0f;
-  for(int step=0;step<=120;step++) {
-    const float f=step/120.0f;
-    const float a=(startDeg+sweepDeg*f)*DEG_TO_RAD;
-    const int x=CX+(int)lroundf(cosf(a)*92.0f);
-    const int y=CY+(int)lroundf(sinf(a)*92.0f);
-    const uint16_t c=f<.10f?ice:f<.64f?blue:f<.79f?amber:hot;
-    // The entire reference arc remains visible even at idle.
+  frame.fillCircle(CX,CY,118,0x18C6);
+  frame.fillCircle(CX,CY,115,0x0042);
+  frame.fillCircle(CX,CY,111,0x0000);
+  frame.drawCircle(CX,CY,116,0x4A8F);
+  frame.drawCircle(CX,CY,109,0x2988);
+  frame.drawCircle(CX,CY,106,0x1065);
+
+  // Thin track outside the calibrated colour arc, then the actual sweep.
+  // Each dot is a self-contained integer primitive on the 8-bit sprite.
+  for(int i=0;i<=140;i++) {
+    const float f=(float)i/140.0f;
+    const float a=(arcStart+arcSweep*f)*DEG_TO_RAD;
+    const float co=cosf(a), si=sinf(a);
+    const int x=CX+(int)lroundf(co*95.0f);
+    const int y=CY+(int)lroundf(si*95.0f);
+    const uint16_t c=f<.10f?cyan:f<.65f?blue:f<.80f?amber:red;
     frame.fillCircle(x,y,3,c);
-    if(ok && fabsf(f-fraction)<=.018f)frame.fillCircle(x,y,5,blend565(c,0xFFFF,75));
+    // Textured outer edge gives an OEM instrument feel; not fake neon.
+    if((i&1)==0) {
+      const int ox=CX+(int)lroundf(co*102.0f);
+      const int oy=CY+(int)lroundf(si*102.0f);
+      frame.drawPixel(ox,oy,blend565(c,0x0000,100));
+    }
   }
-  const int ticks=currentPage==0?constrain((int)lroundf(cfg.rpmMax/1000.0f),5,10):6;
+  // Fine major ticks, fewer numbers than V17 to avoid colliding near the arc.
+  const int intervals=page==0?8:5;
+  frame.setTextFont(1);
   frame.setTextDatum(MC_DATUM);
-  frame.setTextFont(1);frame.setTextSize(2);
-  for(int i=0;i<=ticks;i++){
-    const float fractionTick=(float)i/ticks;
-    const float angle=(startDeg+sweepDeg*fractionTick)*DEG_TO_RAD;
-    const int x=CX+(int)lroundf(cosf(angle)*69.0f);
-    const int y=CY+(int)lroundf(sinf(angle)*69.0f);
-    const float vv=lo+(hi-lo)*fractionTick;
-    const String label=currentPage==0?String((int)lroundf(vv/1000.0f)):String((int)lroundf(vv));
-    frame.setTextColor(fractionTick<.64f?0x757F:fractionTick<.79f?amber:hot);
-    frame.drawString(label,x,y);
+  for(int i=0;i<=intervals;i++) {
+    const float f=(float)i/intervals;
+    const float a=(arcStart+arcSweep*f)*DEG_TO_RAD;
+    const float co=cosf(a),si=sinf(a);
+    const int ix=CX+(int)lroundf(co*82.0f);
+    const int iy=CY+(int)lroundf(si*82.0f);
+    const int ex=CX+(int)lroundf(co*86.0f);
+    const int ey=CY+(int)lroundf(si*86.0f);
+    frame.drawLine(ix,iy,ex,ey,steel);
+    // Trim edge labels: large endpoints stay on the scale but away from footer.
+    const float value=lower+(upper-lower)*f;
+    const String label=page==0?String((int)lroundf(value/1000.0f)):
+                       String((int)lroundf(value));
+    const int lx=CX+(int)lroundf(co*70.0f);
+    const int ly=CY+(int)lroundf(si*70.0f);
+    frame.setTextSize(1);
+    frame.setTextColor(f>=.8f?0xF3AD:soft);
+    frame.drawString(label,lx,ly);
   }
-  frame.setTextSize(1);
+
+  // Actual position ONLY when the ECU response is fresh. Smooth indicator
+  // movement without fabricating a number for the idle/no-car condition.
+  if(live && upper>lower) {
+    const float actual=clampFloat((r->value-lower)/(upper-lower),0.0f,1.0f);
+    float &pos=ghostPointerF[page];
+    if(!ghostPointerHasData[page]) {
+      pos=actual;
+      ghostPointerHasData[page]=true;
+    } else pos+=0.28f*(actual-pos);
+    const float a=(arcStart+arcSweep*pos)*DEG_TO_RAD;
+    const int x=CX+(int)lroundf(cosf(a)*95.0f);
+    const int y=CY+(int)lroundf(sinf(a)*95.0f);
+    const uint16_t c=pos>=.8f?red:pos>=.65f?amber:cyan;
+    frame.fillCircle(x,y,6,c);
+    frame.fillCircle(x,y,3,0xFFFF);
+  } else ghostPointerHasData[page]=false;
+
+  // Reference redline remains visible on the RPM scale, even when parked.
+  if(page==0 && cfg.rpmMax>cfg.redline && cfg.redline>0) {
+    const float f=clampFloat(cfg.redline/cfg.rpmMax,0.0f,1.0f);
+    const float a=(arcStart+arcSweep*f)*DEG_TO_RAD;
+    frame.drawLine(CX+(int)lroundf(cosf(a)*103.0f),
+                   CY+(int)lroundf(sinf(a)*103.0f),
+                   CX+(int)lroundf(cosf(a)*110.0f),
+                   CY+(int)lroundf(sinf(a)*110.0f),red);
+  }
+
+  // Clean, centred typography. Source indicator sits ABOVE the radio/footer.
+  // Keep the expected "--" when no vehicle is connected.
   String number="--";
-  if(ok){
-    if(currentPage==0){number=String((int)lroundf(r->value));}
-    else if(currentPage==1)number=String((int)lroundf(r->value));
-    else if(currentPage==2)number=String(r->value,2);
-    else number=String(r->value,1);
+  if(live) {
+    if(page==0||page==1)number=String((int)lroundf(r->value));
+    else number=String(r->value,page==2?2:1);
   }
-  centerFit(number,125,5,0xFFFF,168);
-  centerFit(currentPage==0?"RPM":currentPage==1?"DEG C":currentPage==2?"VOLTS":"BOOST PSI",182,3,0xEF7D,133);
-  centerFit(ok?"LIVE":"NO DATA",203,1,ok?C_GREEN:C_GREY,92);
+  centerFit("GHOST SWEEP",51,1,0x8410,100);
+  centerFit(number,122,5,0xFFFF,165);
+  const char *units=page==0?"RPM":page==1?"COOLANT C":
+                    page==2?"VOLTS":"BOOST PSI";
+  centerFit(units,169,2,0xFFFF,128);
+  frame.fillRoundRect(54,182,132,19,7,0x0842);
+  centerFit(live?(ssmLive?"SUBARU SSM LIVE":"OBD DATA LIVE"):
+            (radioMode==MODE_WIFI_EDITOR?"SETUP / NO ECU":"WAITING FOR ECU"),
+            191,1,live?0x6EFB:steel,122);
+
+  // Tiny peak hold marker only after real boost values have been seen.
+  if(page==3 && live && cfg.boostPeakHold && peakBoost>=lower && upper>lower) {
+    const float f=clampFloat((peakBoost-lower)/(upper-lower),0.0f,1.0f);
+    const float a=(arcStart+arcSweep*f)*DEG_TO_RAD;
+    frame.fillCircle(CX+(int)lroundf(cosf(a)*105.0f),
+                     CY+(int)lroundf(sinf(a)*105.0f),2,amber);
+  }
 }
 
 static void renderV3Variant(uint32_t now,int style) {
@@ -1007,7 +1072,7 @@ static void renderScreen(uint32_t now) {
   uint8_t layout = currentPage==0?cfg.rpmLayout:currentPage==1?cfg.coolantLayout:currentPage==2?cfg.voltageLayout:cfg.boostLayout;
   if(layout==0)renderInstrument(now);
   else renderV3Variant(now,layout);
-  renderTurboBurst(now);
+  if(layout!=8) renderTurboBurst(now);
   drawFooter();
   frame.pushSprite(0,0);
 }
@@ -1154,7 +1219,7 @@ void sendJson(int status, const String &body) {
 
 String statusJson() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"17.0-subaru-ssm\",\"protocol\":";
+  String out = "{\"ok\":true,\"fw\":\"20.0-ghost-sweep-pro\",\"protocol\":";
   out += ssmLive ? "\"Subaru_SSM_CAN_A8\"" : "\"OBD2_Mode01\"";
   out += ",\"ssmStreaming\":";
   out += ssmLive ? "true" : "false";
