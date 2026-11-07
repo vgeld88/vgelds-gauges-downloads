@@ -170,6 +170,7 @@ Reading engineRpm, coolantC, moduleV, mapKpa, baroKpa, boostPsi;
 Reading ssmAfr, ssmAfCorrection, ssmAfLearning, ssmIam, ssmFlkc,
         ssmWgdc, ssmTiming, ssmThrottle, ssmIat, ssmMafVolt, ssmAccel;
 
+static const uint8_t TRIPLE_SENSOR_COUNT = 16;
 static Reading* tripleReading(uint8_t i){
   Reading* a[]={&boostPsi,&coolantC,&moduleV,&engineRpm,&ssmIam,&ssmAfr,
     &ssmWgdc,&ssmFlkc,&ssmTiming,&ssmThrottle,&ssmIat,&ssmAfLearning,
@@ -187,7 +188,6 @@ float peakBoost = -1000.0f;
 
 // ------------------------- UI INPUT ------------------------------
 uint8_t currentPage = 0;
-static const uint8_t TRIPLE_SENSOR_COUNT = 16;
 static uint8_t pageTotal(){return cfg.tripleMode?constrain((int)cfg.tripleCount,1,8):4;}
 static const char* tripleLabel(uint8_t i){
   const char* const a[]={"BOOST","COOLANT","VOLTS","RPM","DAM","AFR","WGDC",
