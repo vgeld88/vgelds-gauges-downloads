@@ -47,6 +47,16 @@ enum RadioMode : uint8_t { MODE_WIFI_EDITOR = 0, MODE_BLUETOOTH_OBD = 1 };
 static uint8_t radioMode = MODE_WIFI_EDITOR;
 static bool bluetoothStarted = false;
 static bool wifiApReady = false;
+// V13 hotspot/client mode. Credentials are provisioned locally by the user,
+// saved in NVS, and NEVER published in status responses or serial logs.
+static String hotspotName;
+static String hotspotPassword;
+static bool hotspotConfigured = false;
+static bool hotspotProvisionPending = false;
+static bool hotspotClearPending = false;
+static bool hotspotWasConnected = false;
+static uint32_t nextHotspotAttemptAt = 0;
+static uint32_t hotspotPendingAt = 0;
 static volatile uint32_t apJoins = 0, apLeaves = 0;
 RTC_NOINIT_ATTR uint32_t rebootMagic;
 RTC_NOINIT_ATTR uint32_t rebootCount;
@@ -835,6 +845,8 @@ static void drawFooter() {
   if (radioMode == MODE_BLUETOOTH_OBD) {
     centerFit(String("DRIVE: ") + message, 211, 1,
               linkState==LinkState::POLLING ? C_GREEN : C_ORANGE, 200);
+  } else if (hotspotConfigured && WiFi.status() == WL_CONNECTED) {
+    centerFit(String("HOTSPOT ") + WiFi.localIP().toString(), 211, 1, C_GREEN, 228);
   } else if (!wifiApReady) {
     centerFit("WIFI AP FAILED", 211, 1, C_RED, 160);
   } else if (WiFi.softAPgetStationNum() > 0) {
@@ -1006,13 +1018,17 @@ void sendJson(int status, const String &body) {
 
 void handleStatus() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"12.0-dual-radio\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
+  String out = "{\"ok\":true,\"fw\":\"13.0-hotspot\",\"protocol\":\"OBD2_Mode01\",\"ssmStreaming\":false,\"bt\":";
   out += linkState == LinkState::POLLING && bt.connected(0) ? "true" : "false";
   out += ",\"page\":" + String(currentPage);
   out += ",\"wifiApReady\":" + String(wifiApReady ? "true" : "false");
   out += ",\"wifiChannel\":1";
   out += ",\"bluetoothStarted\":" + String(bluetoothStarted ? "true" : "false");
   out += ",\"radioMode\":\"wifi_setup\"";
+  out += ",\"hotspotConfigured\":" + String(hotspotConfigured ? "true" : "false");
+  out += ",\"hotspotConnected\":" + String((hotspotConfigured && WiFi.status()==WL_CONNECTED) ? "true" : "false");
+  out += ",\"hotspotSsid\":" + jsonQuote(hotspotConfigured ? hotspotName : "");
+  out += ",\"deviceIp\":" + jsonQuote((hotspotConfigured && WiFi.status()==WL_CONNECTED) ? WiFi.localIP().toString() : WiFi.softAPIP().toString());
   out += ",\"bootCount\":" + String(rebootCount);
   out += ",\"resetReason\":" + jsonQuote(resetText());
   out += ",\"uptimeMs\":" + String((uint32_t)(millis() - startedAt));
@@ -1213,6 +1229,76 @@ void handlePage() {
   } else sendJson(400, "{\"ok\":false,\"message\":\"Page must be 0..3\"}");
 }
 
+void loadHotspotConfig() {
+  Preferences hotspotPrefs;
+  if (hotspotPrefs.begin("rdhotspot", true)) {
+    hotspotName = hotspotPrefs.getString("ssid", "");
+    hotspotPassword = hotspotPrefs.getString("pass", "");
+    hotspotPrefs.end();
+  }
+  hotspotConfigured = hotspotName.length() >= 1 && hotspotName.length() <= 32
+       && hotspotPassword.length() >= 8 && hotspotPassword.length() <= 63;
+}
+void handleHotspotStatus() {
+  String resp = "{\"ok\":true,\"configured\":";
+  resp += hotspotConfigured ? "true" : "false";
+  resp += ",\"connected\":";
+  resp += hotspotConfigured && WiFi.status()==WL_CONNECTED ? "true" : "false";
+  resp += ",\"ssid\":" + jsonQuote(hotspotConfigured ? hotspotName : "");
+  resp += ",\"ip\":" + jsonQuote(hotspotConfigured && WiFi.status()==WL_CONNECTED
+                                  ? WiFi.localIP().toString() : "");
+  resp += "}";
+  sendJson(200, resp);
+}
+void handleHotspotSave() {
+  // Text body: SSID + newline + passphrase. Neither appears in logs or responses.
+  String body = server.arg("plain");
+  int divider = body.indexOf('\n');
+  if (divider < 1 || body.indexOf('\n', divider+1) >= 0 || body.length() > 100) {
+    sendJson(400, "{\"ok\":false,\"message\":\"Expected SSID and password on separate lines\"}");
+    return;
+  }
+  String ssid = body.substring(0, divider);
+  String pass = body.substring(divider + 1);
+  if (ssid.length() < 1 || ssid.length() > 32 || pass.length() < 8 || pass.length() > 63 ||
+      ssid.indexOf('\r') >= 0 || pass.indexOf('\r') >= 0) {
+    sendJson(400, "{\"ok\":false,\"message\":\"SSID must be 1-32 bytes, WPA2 password 8-63 bytes\"}");
+    return;
+  }
+  Preferences prefs;
+  if (!prefs.begin("rdhotspot", false)) {
+    sendJson(500, "{\"ok\":false,\"message\":\"Could not save hotspot settings\"}");
+    return;
+  }
+  bool saved = prefs.putString("ssid", ssid) > 0 &&
+               prefs.putString("pass", pass) > 0;
+  prefs.end();
+  if (!saved) {
+    sendJson(500, "{\"ok\":false,\"message\":\"Could not store credentials\"}");
+    return;
+  }
+  hotspotName = ssid;
+  hotspotPassword = pass;
+  hotspotConfigured = true;
+  hotspotPendingAt = millis();
+  hotspotProvisionPending = true;
+  sendJson(200, "{\"ok\":true,\"message\":\"Saved. Enable your Samsung hotspot in 2.4 GHz mode.\"}");
+}
+void handleHotspotClear() {
+  Preferences prefs;
+  if (!prefs.begin("rdhotspot", false)) {
+    sendJson(500, "{\"ok\":false,\"message\":\"Could not clear settings\"}");
+    return;
+  }
+  prefs.clear();
+  prefs.end();
+  hotspotConfigured = false;
+  hotspotName = "";
+  hotspotPassword = "";
+  hotspotPendingAt = millis();
+  hotspotClearPending = true;
+  sendJson(200, "{\"ok\":true,\"message\":\"Hotspot settings cleared. Returning to ESP32 Wi-Fi.\"}");
+}
 void onSoftAPEvent(WiFiEvent_t event, WiFiEventInfo_t info) {
   if (event == ARDUINO_EVENT_WIFI_AP_STACONNECTED) {
     apJoins++;
@@ -1239,11 +1325,56 @@ void initHttp() {
   server.on("/api/config", HTTP_POST, [](){handleWriteConfig(true);});
   server.on("/api/preview", HTTP_POST, [](){handleWriteConfig(false);});
   server.on("/api/page", HTTP_POST, handlePage);
+  server.on("/api/hotspot", HTTP_GET, handleHotspotStatus);
+  server.on("/api/hotspot", HTTP_POST, handleHotspotSave);
+  server.on("/api/hotspot/clear", HTTP_POST, handleHotspotClear);
   server.onNotFound([](){sendJson(404,"{\"ok\":false,\"message\":\"Not found\"}");});
   server.begin();
   Serial.printf("RoundDash Wi-Fi: %s / IP %s\n", AP_SSID, WiFi.softAPIP().toString().c_str());
 }
 
+static void serviceHotspot(uint32_t now) {
+  if (hotspotClearPending && (uint32_t)(now-hotspotPendingAt)>600) {
+    hotspotClearPending = false;
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_OFF);
+    initHttp(); // original, proven WPA2 AP fallback
+    return;
+  }
+  if (hotspotProvisionPending && (uint32_t)(now-hotspotPendingAt)>700) {
+    hotspotProvisionPending = false;
+    WiFi.mode(WIFI_AP_STA);
+    nextHotspotAttemptAt = now;
+    Serial.println("[HOTSPOT] Credentials saved; enabling station mode.");
+  }
+  if (!hotspotConfigured) return;
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!hotspotWasConnected) {
+      hotspotWasConnected = true;
+      Serial.printf("[HOTSPOT] Connected; local address %s\n",
+                    WiFi.localIP().toString().c_str());
+      // Once the ESP32 joins the Samsung hotspot, release its separate AP.
+      WiFi.softAPdisconnect(false);
+      WiFi.mode(WIFI_STA);
+      wifiApReady = false;
+    }
+    return;
+  }
+  if (hotspotWasConnected) {
+    hotspotWasConnected = false;
+    // When the phone hotspot goes away, restore the working RoundDash AP.
+    WiFi.mode(WIFI_AP_STA);
+    wifiApReady = WiFi.softAP(AP_SSID, AP_PASSWORD, 1, false, 4);
+    nextHotspotAttemptAt = now + 15000;
+    Serial.println("[HOTSPOT] Lost phone connection. RoundDash AP restored.");
+  }
+  if ((int32_t)(now-nextHotspotAttemptAt)>=0 && WiFi.softAPgetStationNum()==0) {
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.begin(hotspotName.c_str(), hotspotPassword.c_str());
+    nextHotspotAttemptAt = now + 15000;
+    Serial.println("[HOTSPOT] Trying stored Samsung hotspot (credentials not logged).");
+  }
+}
 // -------------------------- ARDUINO ------------------------------
 void setup() {
   Serial.begin(115200);
@@ -1254,6 +1385,7 @@ void setup() {
   Serial.printf("[BOOT] count=%lu reset=%d heap=%u\n", (unsigned long)rebootCount,
                 (int)lastResetReason, ESP.getFreeHeap());
   loadConfig();
+  loadHotspotConfig();
   // Automatic crash recovery: if enabling BT led to watchdog, panic, or
   // brownout, return to Wi-Fi-safe mode rather than rebooting endlessly.
   if (radioMode == MODE_BLUETOOTH_OBD &&
@@ -1304,7 +1436,10 @@ void setup() {
 
 void loop() {
   uint32_t now = millis();
-  if (radioMode == MODE_WIFI_EDITOR) server.handleClient();
+  if (radioMode == MODE_WIFI_EDITOR) {
+    server.handleClient();
+    serviceHotspot(now);
+  }
   updateButton(now);
   if (radioMode == MODE_BLUETOOTH_OBD && bluetoothStarted) updateObd(now);
   renderScreen(now);
