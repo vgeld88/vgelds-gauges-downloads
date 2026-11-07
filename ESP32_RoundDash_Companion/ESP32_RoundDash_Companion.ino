@@ -1187,19 +1187,83 @@ static void drawFooter() {
     centerFit(String("BOOT ") + rebootCount + " " + resetText(), 25, 1,
               lastResetReason == ESP_RST_BROWNOUT ? C_RED : C_ORANGE, 170);
   }
-  for(int i=0;i<4;i++)frame.fillCircle(102+12*i,226,2,i==currentPage?cfg.accent565:C_DIM);
+  const int count=pageTotal();
+  const int first=120-(count-1)*6;
+  for(int i=0;i<count;i++)
+    frame.fillCircle(first+12*i,226,2,i==currentPage?cfg.accent565:C_DIM);
+}
+
+
+// ----------------- V22 THREE INDEPENDENT MINI GAUGES ----------------
+// Round 240px GC9A01: 2 dials upper row, 1 dial centred below.
+// All labels and numbers are real ECU readings, or "--" if unavailable.
+static void miniGaugeText(String value,int cx,int cy,int size,uint16_t color,int maxW){
+  frame.setTextFont(1);frame.setTextDatum(MC_DATUM);frame.setTextColor(color);
+  size=constrain(size,1,3);
+  while(size>1 && (int)value.length()*size*6>maxW)size--;
+  frame.setTextSize(size);
+  frame.drawString(value,cx,cy);frame.setTextSize(1);
+}
+static void tripleDial(uint8_t slot,uint8_t id,uint32_t now){
+  const int x=slot==0?76:slot==1?164:120;
+  const int y=slot==2?164:83;
+  Reading *p=tripleReading(id);
+  const bool valid=p&&fresh(*p,now);
+  float lower=0,upper=1;tripleRange(id,lower,upper);
+  const float ratio=valid?clampFloat((p->value-lower)/max(0.01f,upper-lower),0,1):0;
+  const uint16_t accent=id==0?0xEB2C:id==4?0x3EFF:id==7?0xFCE5:cfg.accent565;
+  frame.fillCircle(x,y,40,0x39EC);
+  frame.fillCircle(x,y,38,0x0863);
+  frame.fillCircle(x,y,35,0x0000);
+  for(int t=0;t<=40;t++){
+    const float f=t/40.0f;
+    const float a=(157.5f+225.0f*f)*DEG_TO_RAD;
+    const int px=x+(int)lroundf(cosf(a)*33);
+    const int py=y+(int)lroundf(sinf(a)*33);
+    frame.fillCircle(px,py,valid&&f<=ratio?2:1,valid&&f<=ratio?accent:0x39A8);
+  }
+  if(valid){
+    const float a=(157.5f+225.0f*ratio)*DEG_TO_RAD;
+    frame.fillCircle(x+(int)lroundf(cosf(a)*33),
+                     y+(int)lroundf(sinf(a)*33),3,0xFFFF);
+  }
+  miniGaugeText(tripleLabel(id),x,y-16,1,0xBDF7,66);
+  String label="--";
+  if(valid) {
+    if(id==1||id==3||id==10||id==13||id==14)
+      label=String((int)lroundf(p->value));
+    else if(id==4||id==7||id==8||id==11||id==12)
+      label=String(p->value,2);
+    else label=String(p->value,1);
+  }
+  miniGaugeText(label,x,y+1,2,0xFFFF,67);
+  miniGaugeText(tripleUnit(id),x,y+19,1,accent,55);
+}
+static void tripleDashboard(uint32_t now){
+  frame.fillSprite(0x0000);
+  frame.drawCircle(CX,CY,118,0x6B4D);
+  frame.drawCircle(CX,CY,115,0x2106);
+  miniGaugeText(String("SET ")+(currentPage+1)+" / "+pageTotal(),
+                CX,29,1,0xAD55,125);
+  for(uint8_t i=0;i<3;i++)
+    tripleDial(i,cfg.tripleSlots[currentPage][i],now);
 }
 
 static void renderScreen(uint32_t now) {
   if(!frameReady)return;
   if(lastFrameAt!=0&&!elapsed(now,lastFrameAt,FRAME_MS))return;
   lastFrameAt=now;
-  dialBase();
-  uint8_t layout = currentPage==0?cfg.rpmLayout:currentPage==1?cfg.coolantLayout:currentPage==2?cfg.voltageLayout:cfg.boostLayout;
-  if(layout==0)renderInstrument(now);
-  else renderV3Variant(now,layout);
-  if(layout!=8) renderTurboBurst(now);
-  drawFooter();
+  if(cfg.tripleMode) {
+    tripleDashboard(now);
+    drawFooter();
+  } else {
+    dialBase();
+    uint8_t layout = currentPage==0?cfg.rpmLayout:currentPage==1?cfg.coolantLayout:currentPage==2?cfg.voltageLayout:cfg.boostLayout;
+    if(layout==0)renderInstrument(now);
+    else renderV3Variant(now,layout);
+    if(layout!=8) renderTurboBurst(now);
+    drawFooter();
+  }
   frame.pushSprite(0,0);
 }
 
