@@ -13,7 +13,7 @@
      GC9A01_DRIVER, TFT_WIDTH 240, TFT_HEIGHT 240
      TFT_MOSI 23, TFT_SCLK 18, TFT_CS -1, TFT_DC 2, TFT_RST -1
      SPI_FREQUENCY 40000000
-  One SPI bus, manual CS pins 15/16/17, shared hardware reset on GPIO4.
+  One SPI bus, manual CS pins 15/25/26, shared hardware reset on GPIO4.
 
   Display RAM (front buffer) + one full TFT_eSprite (back buffer)
   provide double-buffered, tear-minimized rendering. An 8-bit sprite
@@ -75,7 +75,7 @@ constexpr uint8_t BUTTON_PIN = 0;
 // The full firmware MUST compile with TFT_CS=-1 and TFT_RST=-1 so
 // TFT_eSPI does not override the per-screen manual chip selection.
 static constexpr uint8_t PHYSICAL_SCREENS=3;
-static constexpr uint8_t PHYSICAL_CS[PHYSICAL_SCREENS]={15,16,17};
+static constexpr uint8_t PHYSICAL_CS[PHYSICAL_SCREENS]={15,25,26};
 static constexpr uint8_t PHYSICAL_RESET_PIN=4;
 static void deselectAllScreens() {
   for(uint8_t i=0;i<PHYSICAL_SCREENS;i++)digitalWrite(PHYSICAL_CS[i],HIGH);
@@ -1512,7 +1512,7 @@ void sendJson(int status, const String &body) {
 
 String statusJson() {
   uint32_t now = millis();
-  String out = "{\"ok\":true,\"fw\":\"23.0-three-physical-screens\",\"protocol\":";
+  String out = "{\"ok\":true,\"fw\":\"24.0-cs15-25-26\",\"protocol\":";
   out += ssmLive ? "\"Subaru_SSM_CAN_A8\"" : "\"OBD2_Mode01\"";
   out += ",\"ssmStreaming\":";
   out += ssmLive ? "true" : "false";
